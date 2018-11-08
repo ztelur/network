@@ -591,14 +591,28 @@ int tcp_ioctl(struct sock *sk, int cmd, unsigned long arg)
 }
 EXPORT_SYMBOL(tcp_ioctl);
 
+/**
+ * 用于标记一个数据包的push位
+ * @param tp
+ * @param skb
+ */
 static inline void tcp_mark_push(struct tcp_sock *tp, struct sk_buff *skb)
 {
 	TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_PSH;
 	tp->pushed_seq = tp->write_seq;
 }
-
+/**
+ * TCP协议提供了PUSH功能，只要添加了该标志位，TCP会尽快将消息发送出去，多用于传输的消息指令。
+ * 在目前的TCP实现中，用户往往不会指定PUSH，而是TCP自己指定，但是函数给出了必须设置PUSH标志位的一种情况
+ * 从这里可以看出，在Linux中，如果缓存的数据量超过了窗口大小的一半以上，就会被尽快发送出去
+ * @param tp
+ * @return
+ */
 static inline bool forced_push(const struct tcp_sock *tp)
 {
+	/** 当上一次被PUSH出去的包的序号和当前的序号
+     * 相差超过窗口的一半时，会强行被PUSH。
+     */
 	return after(tp->write_seq, tp->pushed_seq + (tp->max_window >> 1));
 }
 
@@ -645,16 +659,30 @@ static bool tcp_should_autocork(struct sock *sk, struct sk_buff *skb,
 	       skb != tcp_write_queue_head(sk) &&
 	       atomic_read(&sk->sk_wmem_alloc) > skb->truesize;
 }
-
+/**
+ * 用于发送处于队列中的包
+ * @param sk
+ * @param flags
+ * @param mss_now
+ * @param nonagle
+ * @param size_goal
+ */
 static void tcp_push(struct sock *sk, int flags, int mss_now,
 		     int nonagle, int size_goal)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct sk_buff *skb;
 
+	/**
+	 * 如果已经没有可以发送的包，直接返回
+	 */
 	if (!tcp_send_head(sk))
 		return;
 
+	/**
+	 * 取出队尾的包，如果没有更多片段或者满足PUSH的条件，则将
+	 * 该包标记为PUSH
+	 */
 	skb = tcp_write_queue_tail(sk);
 	if (!(flags & MSG_MORE) || forced_push(tp))
 		tcp_mark_push(tp, skb);
@@ -677,7 +705,9 @@ static void tcp_push(struct sock *sk, int flags, int mss_now,
 
 	if (flags & MSG_MORE)
 		nonagle = TCP_NAGLE_CORK;
-
+	/**
+	 * 真正发送
+	 */
 	__tcp_push_pending_frames(sk, mss_now, nonagle);
 }
 
@@ -1051,32 +1081,63 @@ void tcp_free_fastopen_req(struct tcp_sock *tp)
 	}
 }
 
+/**
+ * 开启Fast Open时调用，会分配一个tcp_fastopen_request
+ * @param sk
+ * @param msg
+ * @param copied
+ * @param size
+ * @return
+ */
 static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg,
 				int *copied, size_t size)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	int err, flags;
 
+	/**
+	 * 如果没有开启这个功能，则返回
+	 */
 	if (!(sysctl_tcp_fastopen & TFO_CLIENT_ENABLE))
 		return -EOPNOTSUPP;
+	/**
+	 * 如果已经有其他正在准备发送的数据，则返回错误
+	 */
 	if (tp->fastopen_req)
 		return -EALREADY; /* Another Fast Open is in progress */
+	/**
+	 * 分配空间并将用户数据块赋值给相应字段
+	 */
 
 	tp->fastopen_req = kzalloc(sizeof(struct tcp_fastopen_request),
 				   sk->sk_allocation);
 	if (unlikely(!tp->fastopen_req))
 		return -ENOBUFS;
+	/**
+	 * 设置request的信息
+	 */
 	tp->fastopen_req->data = msg;
 	tp->fastopen_req->size = size;
 
 	flags = (msg->msg_flags & MSG_DONTWAIT) ? O_NONBLOCK : 0;
+	/** 由于fast open时，连接还未建立，因此，这里直接调用了下面的
+     * 函数建立连接。这样数据就可以在连接建立的过程中被发送出去了。
+     */
 	err = __inet_stream_connect(sk->sk_socket, msg->msg_name,
 				    msg->msg_namelen, flags);
 	*copied = tp->fastopen_req->copied;
+	/**
+	 * 释放fastopen_request
+	 */
 	tcp_free_fastopen_req(tp);
 	return err;
 }
 
+/**
+ * sk: 套接字
+ * msg: 要传输的用户层的数据
+ * size: 数据大小
+ */
 int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -1088,9 +1149,16 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	bool sg;
 	long timeo;
 
+	/**
+	 * 在发送和接收TCP数据前都要对传输控制块上锁，以免应用程序主动发送接收和传输控制块被动接收而导致控制块中的发送或接收队列混乱
+	 */
 	lock_sock(sk);
 
 	flags = msg->msg_flags;
+	/**
+	 * 如果是TCP Fast Open feature，则进行相关的特殊发送。
+	 * 关于FAST Open的讨论，详见rfc7413
+	 */
 	if (flags & MSG_FASTOPEN) {
 		err = tcp_sendmsg_fastopen(sk, msg, &copied_syn, size);
 		if (err == -EINPROGRESS && copied_syn > 0)
@@ -1099,11 +1167,24 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 			goto out_err;
 	}
 
+	/**
+	 * 获取发送数据是否进行阻塞标识，通过
+	 * sock_sndtimeo()获取阻塞超时时间。
+	 */
 	timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
 
 	/* Wait for a connection to finish. One exception is TCP Fast Open
 	 * (passive side) where data is allowed to be sent before a connection
 	 * is fully established.
+	 */
+	/**
+	 * sk_state的值在tcp_states.h中定义
+	 * TCP只在ESTABLISHED或CLOSE_WAIT这两种状态下，接收窗口
+	 * 是打开的，才能接收数据。因此如果不处于这两种
+	 * 状态，则调用sk_stream_wait_connect()等待建立起连接，一旦
+	 * 超时则跳转到out_err处做出错处理。
+	 *
+	 * 有一种特殊情况，就是出于fastopen的被动端，第三次可以携带数据
 	 */
 	if (((1 << sk->sk_state) & ~(TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)) &&
 	    !tcp_passive_fastopen(sk)) {
@@ -1138,28 +1219,52 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 
 	/* Ok commence sending. */
+	/**
+	 * copied是已从用户数据块复制到SKB的字节数。
+	 */
 	copied = 0;
 
 restart:
+	/**
+	 * 调用tcp_send_mss获取当前有效的mss
+	 * size_goal存储的是TCP分段中数据部分的最大长度
+	 * 对于不支持分片的网卡，mss就是size_goal
+	 */
 	mss_now = tcp_send_mss(sk, &size_goal, flags);
 
+	/**
+	 * 在开始分段前，将错误码初始为EPIPE，判断套接字状态
+	 */
 	err = -EPIPE;
 	if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
 		goto out_err;
 
 	sg = !!(sk->sk_route_caps & NETIF_F_SG);
-
+	/**
+	 * 知道将所有数据都发送完
+	 */
 	while (msg_data_left(msg)) {
-		int copy = 0;
+		/**
+		 * segment过程
+		 */
+		int copy = 0; // 可以拷贝的数据的大小
 		int max = size_goal;
 
+		/**
+		 * 获取sk->sk_write_queue的最后一个skb，用于检查是否用满
+		 * 用满了就新建一个skb放新数据，否则将新数据拼接到这最后一个skb中
+		 */
 		skb = tcp_write_queue_tail(sk);
+		// TODO: tcp_send_head
 		if (tcp_send_head(sk)) {
 			if (skb->ip_summed == CHECKSUM_NONE)
 				max = mss_now;
 			copy = max - skb->len;
 		}
-
+		/**
+		 * 需要一个新的segment
+		 * //说明sk发送队列的最后一个skb已经没有多余的空间了，则需要从新开辟skb空间
+		 */
 		if (copy <= 0 || !tcp_skb_can_collapse_to(skb)) {
 new_segment:
 			/* Allocate new segment. If the interface is SG,
@@ -1186,7 +1291,13 @@ new_segment:
 			if (sk_check_csum_caps(sk))
 				skb->ip_summed = CHECKSUM_PARTIAL;
 
+			/**
+			 * 将skb放置到sk尾部
+			 */
 			skb_entail(sk, skb);
+			/**
+			 * copy表示复制到skb的数据size
+			 */
 			copy = size_goal;
 			max = size_goal;
 
@@ -1199,27 +1310,54 @@ new_segment:
 		}
 
 		/* Try to append data to the end of skb. */
+		/**
+		 * 如果允许copy的数值已经大于剩余的data size，
+		 * 设置为实际的剩余的data size
+		 */
 		if (copy > msg_data_left(msg))
 			copy = msg_data_left(msg);
 
 		/* Where to copy to? */
 		if (skb_availroom(skb) > 0) {
+			/**
+			 * 缓冲区域的剩余区域大小
+			 */
 			/* We have some space in skb head. Superb! */
 			copy = min_t(int, copy, skb_availroom(skb));
+			/**
+			 * 把应用层发送的数据线填充一部分到tail skb中
+			 */
 			err = skb_add_data_nocache(sk, skb, &msg->msg_iter, copy);
 			if (err)
 				goto do_fault;
 		} else {
-			bool merge = true;
+			/**
+			 * 线性缓冲已经满了，将数据考到shinfo
+			 *
+			 * 如果SKB线性存储区底部已经没有空间了，那就需要把数据复制到支持分散聚合的分页中
+			 *
+			 * merge标识是否在最后一个分页中添加数据，初始化为0
+			 */
+			bool merge = true; //判断最后一个分页能否追加数据
+			/**
+			 * 获取当前skb的分segment数，在skb_shared_info中用nr_frags表示
+			 */
 			int i = skb_shinfo(skb)->nr_frags;
+
 			struct page_frag *pfrag = sk_page_frag(sk);
 
 			if (!sk_page_frag_refill(sk, pfrag))
 				goto wait_for_memory;
 
+			/**
+			 * 判断能否在最后一个分片加数据
+			 */
 			if (!skb_can_coalesce(skb, i, pfrag->page,
 					      pfrag->offset)) {
 				if (i == sysctl_max_skb_frags || !sg) {
+					/**
+					 * 无法设置分配，就重新分配一个SKB
+					 */
 					tcp_mark_push(tp, skb);
 					goto new_segment;
 				}
@@ -1230,15 +1368,16 @@ new_segment:
 
 			if (!sk_wmem_schedule(sk, copy))
 				goto wait_for_memory;
-
+			/**
+			 * 将用户数据库拷贝到SKB中
+			 */
 			err = skb_copy_to_page_nocache(sk, &msg->msg_iter, skb,
 						       pfrag->page,
 						       pfrag->offset,
 						       copy);
 			if (err)
 				goto do_error;
-
-			/* Update the skb. */
+			/* 更新SKB */
 			if (merge) {
 				skb_frag_size_add(&skb_shinfo(skb)->frags[i - 1], copy);
 			} else {
@@ -1251,7 +1390,9 @@ new_segment:
 
 		if (!copied)
 			TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_PSH;
-
+		/*
+		 * 更新TCP的发送序号
+		 */
 		tp->write_seq += copy;
 		TCP_SKB_CB(skb)->end_seq += copy;
 		tcp_skb_pcount_set(skb, 0);
@@ -1267,7 +1408,13 @@ new_segment:
 		if (skb->len < max || (flags & MSG_OOB) || unlikely(tp->repair))
 			continue;
 
+		/**
+		 * 检查该数据是否需要立即发送
+		 */
 		if (forced_push(tp)) {
+			/**
+			 * 调用相关函数将队列中的数据立刻发送
+			 */
 			tcp_mark_push(tp, skb);
 			__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
 		} else if (skb == tcp_send_head(sk))
@@ -1275,8 +1422,14 @@ new_segment:
 		continue;
 
 wait_for_sndbuf:
+		/**
+		 * 设置当前状态为无空间模式，并等待内存空间
+		 */
 		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 wait_for_memory:
+		/**
+		 * 如果已经有一部分数据了，那么先将数据发送出去
+		 */
 		if (copied)
 			tcp_push(sk, flags & ~MSG_MORE, mss_now,
 				 TCP_NAGLE_PUSH, size_goal);
@@ -1287,10 +1440,20 @@ wait_for_memory:
 
 		mss_now = tcp_send_mss(sk, &size_goal, flags);
 	}
-
+	/**
+	 * 后续都是错误处理，正常退出也会经过out和out_nopush
+	 */
 out:
+	/**
+	 * 如果发生了超时或者要正常退出，且已经拷贝了数据，那么尝试将该数据发出
+	 */
+
 	if (copied)
 		tcp_push(sk, flags, mss_now, tp->nonagle, size_goal);
+	/**
+	 * 将sk释放，并返回已经发出的数据量
+	 */
+
 out_nopush:
 	release_sock(sk);
 	return copied + copied_syn;

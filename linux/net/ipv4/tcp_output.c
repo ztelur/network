@@ -898,6 +898,15 @@ out:
  * We are working here with either a clone of the original
  * SKB, or a fresh unique copy made by the retransmit engine.
  */
+/**
+ * 真正的发送操作由它完成，构建TCP的首部，并将包交给IP层。
+ * 由于数据包需要等到ACK后才释放，所以需要发送队列中长期保留一份SKB的备份。
+ * @param sk
+ * @param skb
+ * @param clone_it
+ * @param gfp_mask 内存分配方式
+ * @return
+ */
 static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 			    gfp_t gfp_mask)
 {
@@ -2036,6 +2045,15 @@ static int tcp_mtu_probe(struct sock *sk)
  * Returns true, if no segments are in flight and we have queued segments,
  * but cannot send anything now because of SWS or another problem.
  */
+/**
+ * 在上边的代码，最终都是调用该函数进行真正的发送
+ * @param sk 套接字
+ * @param mss_now 当前有效的mss
+ * @param nonagle 是否开启Nagle算法
+ * @param push_one 大于0时，最多发送一个包
+ * @param gfp
+ * @return
+ */
 static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			   int push_one, gfp_t gfp)
 {
@@ -2047,10 +2065,15 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 	bool is_cwnd_limited = false;
 	u32 max_segs;
 
+	/**
+	 * 统计发送包的数量
+	 */
 	sent_pkts = 0;
-
+	// 当push_one为0时
 	if (!push_one) {
-		/* Do MTU probing. */
+		/**
+		 * 进行MTU探测
+		 */
 		result = tcp_mtu_probe(sk);
 		if (!result) {
 			return false;
@@ -2059,10 +2082,18 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		}
 	}
 
+	/**
+	 * 获取最大segment数
+	 */
 	max_segs = tcp_tso_autosize(sk, mss_now);
+	/**
+	 * 不断循环发送队列，进行发送
+	 */
 	while ((skb = tcp_send_head(sk))) {
 		unsigned int limit;
-
+		/**
+		 * 获取TSO信息
+		 */
 		tso_segs = tcp_init_tso_segs(skb, mss_now);
 		BUG_ON(!tso_segs);
 
@@ -2071,31 +2102,46 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			skb_mstamp_get(&skb->skb_mstamp);
 			goto repair; /* Skip network transmission */
 		}
-
+		/**
+		 * 获取CWND的剩余大小
+		 */
 		cwnd_quota = tcp_cwnd_test(tp, skb);
 		if (!cwnd_quota) {
 			if (push_one == 2)
+				/**
+				 * 强制发送发送一个包进行丢包检验
+				 */
 				/* Force out a loss probe pkt. */
 				cwnd_quota = 1;
 			else
 				break;
 		}
-
+		/**
+		 * 如果当前段不完全在发送窗口，则无法发送
+		 */
 		if (unlikely(!tcp_snd_wnd_test(tp, skb, mss_now)))
 			break;
 
 		if (tso_segs == 1) {
+			/**
+			 * 如果无需TSO分段，则检测是否启用Nagle算法
+			 */
 			if (unlikely(!tcp_nagle_test(tp, skb, mss_now,
 						     (tcp_skb_is_last(sk, skb) ?
 						      nonagle : TCP_NAGLE_PUSH))))
 				break;
 		} else {
+			/**
+			 * 如果需要TSO分段，则检测是否需要延迟发送
+			 */
 			if (!push_one &&
 			    tcp_tso_should_defer(sk, skb, &is_cwnd_limited,
 						 max_segs))
 				break;
 		}
-
+		/**
+		 * 根据mss对包进行分包处理
+		 */
 		limit = mss_now;
 		if (tso_segs > 1 && !tcp_urg_mode(tp))
 			limit = tcp_mss_split_point(sk, skb, mss_now,
@@ -2103,7 +2149,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 							  cwnd_quota,
 							  max_segs),
 						    nonagle);
-
+		/**
+		 * 如果长度超过了限制，那么进行分段
+		 */
 		if (skb->len > limit &&
 		    unlikely(tso_fragment(sk, skb, limit, mss_now, gfp)))
 			break;
@@ -2118,6 +2166,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		 * of queued bytes to ensure line rate.
 		 * One example is wifi aggregation (802.11 AMPDU)
 		 */
+		/**
+		 * TCP小队列机制
+		 */
 		limit = max(2 * skb->truesize, sk->sk_pacing_rate >> 10);
 		limit = min_t(u32, limit, sysctl_tcp_limit_output_bytes);
 
@@ -2131,7 +2182,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			if (atomic_read(&sk->sk_wmem_alloc) > limit)
 				break;
 		}
-
+		/**
+		 * 将包真正的发送出去
+		 */
 		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
 			break;
 
@@ -2140,14 +2193,18 @@ repair:
 		 * This call will increment packets_out.
 		 */
 		tcp_event_new_data_sent(sk, skb);
-
+		/**
+		 * 如果发送的段小于mss，则更新最后一个小包的序号
+		 */
 		tcp_minshall_update(tp, mss_now, skb);
 		sent_pkts += tcp_skb_pcount(skb);
 
 		if (push_one)
 			break;
 	}
-
+	/**
+	 * 如果发送了数据，则更新相关的数据统计
+	 */
 	if (likely(sent_pkts)) {
 		if (tcp_in_cwnd_reduction(sk))
 			tp->prr_out += sent_pkts;
@@ -2303,6 +2360,12 @@ rearm_timer:
  * TCP_CORK or attempt at coalescing tiny packets.
  * The socket must be locked by the caller.
  */
+/**
+ * 将等待在队列中的所有包发送出去
+ * @param sk
+ * @param cur_mss
+ * @param nonagle
+ */
 void __tcp_push_pending_frames(struct sock *sk, unsigned int cur_mss,
 			       int nonagle)
 {
@@ -2310,9 +2373,14 @@ void __tcp_push_pending_frames(struct sock *sk, unsigned int cur_mss,
 	 * In time closedown will finish, we empty the write queue and
 	 * all will be happy.
 	 */
+	/**
+	 * 如果连接已经关闭，直接返回
+	 */
 	if (unlikely(sk->sk_state == TCP_CLOSE))
 		return;
-
+	/**
+	 * 将剩余数据发送出去
+	 */
 	if (tcp_write_xmit(sk, cur_mss, nonagle, 0,
 			   sk_gfp_mask(sk, GFP_ATOMIC)))
 		tcp_check_probe_timer(sk);
@@ -2320,6 +2388,11 @@ void __tcp_push_pending_frames(struct sock *sk, unsigned int cur_mss,
 
 /* Send _single_ skb sitting at the send head. This function requires
  * true push pending frames to setup probe timer etc.
+ */
+/**
+ * 将发送队列首部的单个包发送出去
+ * @param sk
+ * @param mss_now
  */
 void tcp_push_one(struct sock *sk, unsigned int mss_now)
 {
