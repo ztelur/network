@@ -261,13 +261,26 @@ EXPORT_SYMBOL(tcp_select_initial_window);
  * value can be stuffed directly into th->window for an outgoing
  * frame.
  */
+/**
+ * 选择一个新的窗口大小用于便于更新tcp_sock,返回的结果根据RF1323进行缩放
+ * @param sk
+ * @return
+ */
 static u16 tcp_select_window(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
+	/**
+	 * old_win 接收方的window size
+	 * cur_win 当前接收方的window size
+	 * new_win 新选出来的
+	 */
 	u32 old_win = tp->rcv_wnd;
 	u32 cur_win = tcp_receive_window(tp);
 	u32 new_win = __tcp_select_window(sk);
 
+	/**
+	 * 当新窗口大小小于当前窗口时，不能缩小窗口大小。
+	 */
 	/* Never shrink the offered window */
 	if (new_win < cur_win) {
 		/* Danger Will Robinson!
@@ -280,19 +293,32 @@ static u16 tcp_select_window(struct sock *sk)
 		if (new_win == 0)
 			NET_INC_STATS(sock_net(sk),
 				      LINUX_MIB_TCPWANTZEROWINDOWADV);
+		/**
+		 * 大于cur_win的rcv_wscale的整倍数
+		 */
 		new_win = ALIGN(cur_win, 1 << tp->rx_opt.rcv_wscale);
 	}
+	/**
+	 * 将当前窗口size设置为新的窗口大小
+	 */
 	tp->rcv_wnd = new_win;
 	tp->rcv_wup = tp->rcv_nxt;
 
 	/* Make sure we do not exceed the maximum possible
 	 * scaled window.
 	 */
+	/**
+	 * 判断当前窗口未越界
+	 */
 	if (!tp->rx_opt.rcv_wscale && sysctl_tcp_workaround_signed_windows)
 		new_win = min(new_win, MAX_TCP_WINDOW);
 	else
 		new_win = min(new_win, (65535U << tp->rx_opt.rcv_wscale));
-
+	/**
+	 * RFC1323 缩放窗口大小。这里之所以是右移，是因为此时的new_win是
+         * 窗口的真正大小。所以返回时需要返回正常的可以放在16位整型中的窗口大小。
+         * 所以需要右移。
+	 */
 	/* RFC1323 scaling applied */
 	new_win >>= tp->rx_opt.rcv_wscale;
 
@@ -928,6 +954,9 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 		TCP_SKB_CB(skb)->tx.in_flight = TCP_SKB_CB(skb)->end_seq
 			- tp->snd_una;
 
+		/**
+		 * SKB是原始SKB的克隆，也能是来自重传引擎的一份拷贝
+		 */
 		if (unlikely(skb_cloned(skb)))
 			skb = pskb_copy(skb, gfp_mask);
 		else
@@ -935,7 +964,11 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 		if (unlikely(!skb))
 			return -ENOBUFS;
 	}
-
+	/**
+	 * 正式开始构建TCP的头。
+	 * 首先判断该TCP是否是一个SYN包。如果是，则调用tcp_syn_options来构建相应的options
+	 * 这里只是计算具体的options的大小
+	 */
 	inet = inet_sk(sk);
 	tcb = TCP_SKB_CB(skb);
 	memset(&opts, 0, sizeof(opts));
@@ -945,6 +978,9 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 	else
 		tcp_options_size = tcp_established_options(sk, skb, &opts,
 							   &md5);
+	/**
+	 * 根据options的大小，计算出来header的大小，然后调用相关函数在skb为TCP头部留出空间
+	 */
 	tcp_header_size = tcp_options_size + sizeof(struct tcphdr);
 
 	/* if no packet is in qdisc/device queue, then allow XPS to select
@@ -965,6 +1001,9 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 	skb_set_hash_from_sk(skb, sk);
 	atomic_add(skb->truesize, &sk->sk_wmem_alloc);
 
+	/**
+	 * 真正构建header，并且计算校验和
+	 */
 	/* Build TCP header and checksum it. */
 	th = (struct tcphdr *)skb->data;
 	th->source		= inet->inet_sport;
@@ -987,7 +1026,9 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 			th->urg = 1;
 		}
 	}
-
+	/**
+	 * 写完首部后，调用函数将TCP选项写入
+	 */
 	tcp_options_write((__be32 *)(th + 1), tp, &opts);
 	skb_shinfo(skb)->gso_type = sk->sk_gso_type;
 	if (likely(!(tcb->tcp_flags & TCPHDR_SYN))) {
@@ -1007,9 +1048,13 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 					       md5, sk, skb);
 	}
 #endif
-
+	/**
+	 * 进入将包发送给IP层的地方
+	 */
 	icsk->icsk_af_ops->send_check(sk, skb);
-
+	/**
+	 * 触发相关的TCP事件，这些会被用在拥塞控制算法
+	 */
 	if (likely(tcb->tcp_flags & TCPHDR_ACK))
 		tcp_event_ack_sent(sk, tcp_skb_pcount(skb));
 
@@ -1033,12 +1078,16 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 	/* Cleanup our debris for IP stacks */
 	memset(skb->cb, 0, max(sizeof(struct inet_skb_parm),
 			       sizeof(struct inet6_skb_parm)));
-
+	/**
+	 * 将包加入到IP的发送队列中
+	 */
 	err = icsk->icsk_af_ops->queue_xmit(sk, skb, &inet->cork.fl);
 
 	if (likely(err <= 0))
 		return err;
-
+    /**
+     * 如果发生了丢包，那么进入拥塞控制状态
+     */
 	tcp_enter_cwr(sk);
 
 	return net_xmit_eval(err);
@@ -2403,11 +2452,16 @@ void tcp_push_one(struct sock *sk, unsigned int mss_now)
 	tcp_write_xmit(sk, mss_now, TCP_NAGLE_PUSH, 1, sk->sk_allocation);
 }
 
+/**
+ *
+ * @param sk
+ * @return
+ */
 /* This function returns the amount that we can raise the
  * usable window based on the following constraints
  *
- * 1. The window can never be shrunk once it is offered (RFC 793)
- * 2. We limit memory per socket
+ * 1. The window can never be shrunk once it is offered (RFC 793) 窗口不能收缩
+ * 2. We limit memory per socket 每个socket使用的内存是有限的
  *
  * RFC 1122:
  * "the suggested [SWS] avoidance algorithm for the receiver is to keep
@@ -2416,6 +2470,9 @@ void tcp_push_one(struct sock *sk, unsigned int mss_now)
  *
  * i.e. don't raise the right edge of the window until you can raise
  * it at least MSS bytes.
+ *
+ * 就是除非缓存的大小多出来至少一个MSS那么多字节，否则不要增长窗口右边界
+的大小。
  *
  * Unfortunately, the recommended algorithm breaks header prediction,
  * since header prediction assumes th->window stays fixed.
@@ -2452,6 +2509,7 @@ void tcp_push_one(struct sock *sk, unsigned int mss_now)
  * Below we obtain similar behavior by forcing the offered window to
  * a multiple of the mss when it is feasible to do so.
  *
+ * Linux采用强制窗口为MSS的整倍数，以获得相似的行为
  * Note, we don't "adjust" for TIMESTAMP or SACK option bytes.
  * Regular options like TIMESTAMP are taken into account.
  */
@@ -2470,11 +2528,12 @@ u32 __tcp_select_window(struct sock *sk)
 	int allowed_space = tcp_full_space(sk);
 	int full_space = min_t(int, tp->window_clamp, allowed_space);
 	int window;
-
+	/* 如果mss超过了总共的空间大小，那么把mss限制在允许的空间范围内。 */
 	if (mss > full_space)
 		mss = full_space;
 
 	if (free_space < (full_space >> 1)) {
+		/* 当空闲空间小于允许空间的一半时。 */
 		icsk->icsk_ack.quick = 0;
 
 		if (tcp_under_memory_pressure(sk))
@@ -2484,6 +2543,9 @@ u32 __tcp_select_window(struct sock *sk)
 		/* free_space might become our new window, make sure we don't
 		 * increase it due to wscale.
 		 */
+		/* free_space有可能成为新的窗口的大小，因此，需要考虑
+                 * 窗口扩展的影响。
+                 */
 		free_space = round_down(free_space, 1 << tp->rx_opt.rcv_wscale);
 
 		/* if free space is less than mss estimate, or is below 1/16th
@@ -2493,6 +2555,11 @@ u32 __tcp_select_window(struct sock *sk)
 		 * With large window, mss test triggers way too late in order
 		 * to announce zero window in time before rmem limit kicks in.
 		 */
+		/* 如果空闲空间小于mss的大小，或者低于最大允许空间的的1/16，那么，
+                * 返回0窗口。否则，tcp_clamp_window()会增长接收缓存到tcp_rmem[2]。
+                * 新进入的数据会由于内醋限制而被丢弃。对于较大的窗口，单纯地探测mss的
+                * 大小以宣告0窗口有些太晚了（可能会超过限制）。
+                */
 		if (free_space < (allowed_space >> 4) || free_space < mss)
 			return 0;
 	}
@@ -2515,6 +2582,11 @@ u32 __tcp_select_window(struct sock *sk)
 			window = (((window >> tp->rx_opt.rcv_wscale) + 1)
 				  << tp->rx_opt.rcv_wscale);
 	} else {
+		/* 如果内存条件允许，那么就把窗口设置为mss的整倍数。
+                 * 或者如果free_space > 当前窗口大小加上全部允许的空间的一半，
+                 * 那么，就将窗口大小设置为free_space
+                 */
+
 		/* Get the largest window that is a nice multiple of mss.
 		 * Window clamp already applied above.
 		 * If our current window offering is within 1 mss of the
