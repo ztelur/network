@@ -4339,13 +4339,17 @@ static void tcp_drop(struct sock *sk, struct sk_buff *skb)
 /* This one checks to see if we can put data from the
  * out_of_order queue into the receive_queue.
  */
+/**
+ * 将out_of_order队列中的报文转移到receive队列中
+ * @param sk
+ */
 static void tcp_ofo_queue(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	__u32 dsack_high = tp->rcv_nxt;
 	struct sk_buff *skb, *tail;
 	bool fragstolen, eaten;
-
+    //遍历out_of_order队列
 	while ((skb = skb_peek(&tp->out_of_order_queue)) != NULL) {
 		if (after(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
 			break;
@@ -4356,7 +4360,7 @@ static void tcp_ofo_queue(struct sock *sk)
 				dsack_high = TCP_SKB_CB(skb)->end_seq;
 			tcp_dsack_extend(sk, TCP_SKB_CB(skb)->seq, dsack);
 		}
-
+        //若这个报文可以按seq插入有序的receive队列中，则将其移出out_of_order队列
 		__skb_unlink(skb, &tp->out_of_order_queue);
 		if (!after(TCP_SKB_CB(skb)->end_seq, tp->rcv_nxt)) {
 			SOCK_DEBUG(sk, "ofo packet was already received\n");
@@ -4371,7 +4375,8 @@ static void tcp_ofo_queue(struct sock *sk)
 		eaten = tail && tcp_try_coalesce(sk, tail, skb, &fragstolen);
 		tcp_rcv_nxt_update(tp, TCP_SKB_CB(skb)->end_seq);
 		if (!eaten)
-			__skb_queue_tail(&sk->sk_receive_queue, skb);
+            //插入receive队列
+            __skb_queue_tail(&sk->sk_receive_queue, skb);
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
 			tcp_fin(sk);
 		if (eaten)
@@ -4595,13 +4600,13 @@ err:
 
 }
 
+
 static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	bool fragstolen = false;
 	int eaten = -1;
-
-	if (TCP_SKB_CB(skb)->seq == TCP_SKB_CB(skb)->end_seq) {
+    if (TCP_SKB_CB(skb)->seq == TCP_SKB_CB(skb)->end_seq) {
 		__kfree_skb(skb);
 		return;
 	}
@@ -4616,11 +4621,15 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	 *  Packets in sequence go to the receive queue.
 	 *  Out of sequence packets to the out_of_order_queue.
 	 */
-	if (TCP_SKB_CB(skb)->seq == tp->rcv_nxt) {
+    //如果这个报文是待接收的报文（看seq），它有两个出路：进入receive队列，正如图1；直接拷贝到用户内存中，如图3
+    if (TCP_SKB_CB(skb)->seq == tp->rcv_nxt) {
 		if (tcp_receive_window(tp) == 0)
 			goto out_of_window;
 
 		/* Ok. In sequence. In window. */
+		/**
+		 * 如果有一个进程正在读取socket，且正在准备拷贝的序号就是当前报文的seq序号
+		 */
 		if (tp->ucopy.task == current &&
 		    tp->copied_seq == tp->rcv_nxt && tp->ucopy.len &&
 		    sock_owned_by_user(sk) && !tp->urg_data) {
@@ -4628,7 +4637,7 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 					  tp->ucopy.len);
 
 			__set_current_state(TASK_RUNNING);
-
+            //直接将报文内容拷贝到用户态内存中，参见图3
 			if (!skb_copy_datagram_msg(skb, 0, tp->ucopy.msg, chunk)) {
 				tp->ucopy.len -= chunk;
 				tp->copied_seq += chunk;
@@ -4653,6 +4662,7 @@ queue_and_out:
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
 			tcp_fin(sk);
 
+        //正如图1第4步，这时会检查out_of_order队列，若它不为空，需要处理它
 		if (!skb_queue_empty(&tp->out_of_order_queue)) {
 			tcp_ofo_queue(sk);
 
@@ -4709,7 +4719,9 @@ drop:
 			goto out_of_window;
 		goto queue_and_out;
 	}
-
+    /**
+     * 加入到out of order队列中
+     */
 	tcp_data_queue_ofo(sk, skb);
 }
 
@@ -5284,6 +5296,13 @@ discard:
  *	the rest is checked inline. Fast processing is turned on in
  *	tcp_data_queue when everything is OK.
  */
+/**
+ * 对于建立状态的TCP接收
+ * @param sk
+ * @param skb
+ * @param th
+ * @param len
+ */
 void tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
 			 const struct tcphdr *th, unsigned int len)
 {
@@ -5465,6 +5484,9 @@ step5:
 	tcp_urg(sk, skb, th);
 
 	/* step 7: process the segment text */
+	/**
+	 * 将报文放在队列中
+	 */
 	tcp_data_queue(sk, skb);
 
 	tcp_data_snd_check(sk);

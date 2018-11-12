@@ -1381,12 +1381,19 @@ static struct sock *tcp_v4_cookie_check(struct sock *sk, struct sk_buff *skb)
  * This is because we cannot sleep with the original spinlock
  * held.
  */
+/**
+ *
+ * @param sk
+ * @param skb
+ * @return
+ */
 int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 {
 	struct sock *rsk;
 
 	if (sk->sk_state == TCP_ESTABLISHED) { /* Fast path */
-		struct dst_entry *dst = sk->sk_rx_dst;
+        //当TCP连接已经建立好时，是由tcp_rcv_established方法处理接收报文的
+        struct dst_entry *dst = sk->sk_rx_dst;
 
 		sock_rps_save_rxhash(sk, skb);
 		sk_mark_napi_id(sk, skb);
@@ -1736,17 +1743,22 @@ process:
 	ret = 0;
 	/**
 	 * 如果此时进程无法访问传输控制块
+	 * 从代码层面上，只要在tcp_recvmsg里，执行lock_sock后只能进入else，而release_sock后会进入if
 	 */
 	if (!sock_owned_by_user(sk)) {
 		/**
 		 * prepare队列可以读取
+		 * //当 tcp_prequeue 返回0时，表示这个函数没有处理该报文
+		 * //如果报文放在prequeue队列，即表示延后处理，不占用软中断过长时间
 		 */
 		if (!tcp_prequeue(sk, skb))
+            //不使用prequeue或者没有用户进程读socket时（图3进入此分支），立刻开始处理这个报文
 			ret = tcp_v4_do_rcv(sk, skb);
 	} else if (unlikely(sk_add_backlog(sk, skb,
 					   sk->sk_rcvbuf + sk->sk_sndbuf))) {
 		/**
 		 * 添加到后备队列成功
+		 * //如果进程正在操作套接字，就把skb指向的TCP报文插入到backlog队列（图3涉及此分支）
 		 */
 		bh_unlock_sock(sk);
 		__NET_INC_STATS(net, LINUX_MIB_TCPBACKLOGDROP);
