@@ -4645,7 +4645,9 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 				tcp_rcv_space_adjust(sk);
 			}
 		}
-
+        /**
+         * 如果没有能够直接拷贝到用户内存中，那么，插入receive队列吧，正如图1中的第1、3步
+         */
 		if (eaten <= 0) {
 queue_and_out:
 			if (eaten < 0) {

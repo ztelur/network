@@ -1754,6 +1754,7 @@ EXPORT_SYMBOL(tcp_read_sock);
 int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 		int flags, int *addr_len)
 {
+
 	struct tcp_sock *tp = tcp_sk(sk);
 	int copied = 0;
 	u32 peek_seq;
@@ -1778,7 +1779,9 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 	/**
 	 * 上述主要用来处理一些特殊情况，下面进行正常流程的处理
 	 */
-
+	/**
+     * //锁住socket，防止多进程并发访问TCP连接，告知软中断目前socket在进程上下文中
+     */
 	lock_sock(sk);
 
 	/**
@@ -1799,6 +1802,7 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 
 	/**
 	 * 获取阻塞读取的超时时间，如果进行非阻塞读取，则超时时间为0。
+	 * 	//如果socket是阻塞套接字，则取出SO_RCVTIMEO作为读超时时间；若为非阻塞，则timeo为0。下面会看到timeo是如何生效的
 	 */
 	timeo = sock_rcvtimeo(sk, nonblock);
 
@@ -1842,6 +1846,10 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 
     最后一行调用相关函数根据是否设置了MSG_WAITALL来确定本次调用需要接收数据的长度。如果设置
     了MSG_WAITALL标志，则读取数据长度为用户调用时输入的参数len。
+	 */
+	/**
+	 * 获取下一个要拷贝的字节序号
+	 * 注意：seq的定义为u32 *seq;，它是32位指针。为何？因为下面每向用户态内存拷贝后，会更新seq的值，这时就会直接更改套接字上的copied_seq
 	 */
 	seq = &tp->copied_seq;
 	if (flags & MSG_PEEK) {

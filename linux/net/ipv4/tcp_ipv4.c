@@ -1404,13 +1404,18 @@ int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 				sk->sk_rx_dst = NULL;
 			}
 		}
+		/**
+		 * 调用该方法进行操作
+		 */
 		tcp_rcv_established(sk, skb, tcp_hdr(skb), skb->len);
 		return 0;
 	}
 
 	if (tcp_checksum_complete(skb))
 		goto csum_err;
-
+	/**
+	 * 处理TCP_LISTEN
+	 */
 	if (sk->sk_state == TCP_LISTEN) {
 		struct sock *nsk = tcp_v4_cookie_check(sk, skb);
 
@@ -1497,7 +1502,7 @@ void tcp_v4_early_demux(struct sk_buff *skb)
  *
  */
 /**
- *
+ * 处理数据，看是否可以放入prequeue队列中
  * @param sk 传输控制块
  * @param skb 缓冲区
  * @return
@@ -1507,6 +1512,8 @@ bool tcp_prequeue(struct sock *sk, struct sk_buff *skb)
 	struct tcp_sock *tp = tcp_sk(sk);
 	/**
 	 * 如果开启了tcp_low_latency或者用户没有在读数据，直接返回
+	 * 允许 TCP/IP 栈适应在高吞吐量情况下低延时的情况
+	 * 	//检查tcp_low_latency，默认其为0，表示使用prequeue队列。tp->ucopy.task不为0，表示有进程启动了拷贝TCP消息的流程
 	 */
 	if (sysctl_tcp_low_latency || !tp->ucopy.task)
 		return false;
@@ -1529,11 +1536,14 @@ bool tcp_prequeue(struct sock *sk, struct sk_buff *skb)
 		skb_dst_force_safe(skb);
 	/**
 	 * 将接收到的段添加到prequeue队列中，并更新prequeue队列消耗的内存
+	 * 到这里，通常是用户进程读数据时没读到指定大小的数据，休眠了。直接将报文插入prequeue队列的末尾，延后处理
+
 	 */
 	__skb_queue_tail(&tp->ucopy.prequeue, skb);
 	tp->ucopy.memory += skb->truesize;
 	/**
 	 * 如果prequeue消耗的内存超过接收缓存上限，则立刻处理prequeue上的segment
+	 * 当然，虽然通常是延后处理，但如果TCP的接收缓冲区不够用了，就会立刻处理prequeue队列里的所有报文
 	 */
 	if (skb_queue_len(&tp->ucopy.prequeue) >= 32 ||
 	    tp->ucopy.memory + atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf) {
@@ -1544,10 +1554,14 @@ bool tcp_prequeue(struct sock *sk, struct sk_buff *skb)
 				skb_queue_len(&tp->ucopy.prequeue));
 
 		while ((skb1 = __skb_dequeue(&tp->ucopy.prequeue)) != NULL)
+            //sk_backlog_rcv就是下文将要介绍的tcp_v4_do_rcv方法
 			sk_backlog_rcv(sk, skb1);
 
 		tp->ucopy.memory = 0;
 	} else if (skb_queue_len(&tp->ucopy.prequeue) == 1) {
+	    /**
+	     * prequeue里有报文了，唤醒正在休眠等待数据的进程，让进程在它的上下文中处理这个prequeue队列的报文
+	     */
 		wake_up_interruptible_sync_poll(sk_sleep(sk),
 					   POLLIN | POLLRDNORM | POLLRDBAND);
 		//不需要发送ack，则复位重新启动延迟确认定时器。
@@ -1744,6 +1758,7 @@ process:
 	/**
 	 * 如果此时进程无法访问传输控制块
 	 * 从代码层面上，只要在tcp_recvmsg里，执行lock_sock后只能进入else，而release_sock后会进入if
+	 * 比较重要的时用户进程是否在读取该socket
 	 */
 	if (!sock_owned_by_user(sk)) {
 		/**
