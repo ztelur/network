@@ -1857,7 +1857,10 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 		seq = &peek_seq;
 	}
 
-	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+    //获取SO_RCVLOWAT最低接收阀值，当然，target实际上是用户态内存大小len和SO_RCVLOWAT的最小值
+    //注意：flags参数中若携带MSG_WAITALL标志位，则意味着必须等到读取到len长度的消息才能返回，此时target只能是len
+
+    target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
 
 	/**
 	 * 接下来通过urg_data和urg_seq来检测当前是否读取到带外数据。如果在
@@ -1880,7 +1883,7 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 		 * 首先获取下一个缓存区
 		 */
 		/* Next get a buffer. */
-
+        //从receive队列取出1个报文
 		last = skb_peek_tail(&sk->sk_receive_queue);
 
 		skb_queue_walk(&sk->sk_receive_queue, skb) {
@@ -1901,6 +1904,8 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 			/**
 			 * 到此，我们已经获取了下一个要读取的数据段，计算该段开始读取数据的偏移位置，
 				当然，该偏移值必须在该段的数据长度范围内才有效。
+			    offset是待拷贝序号在当前这个报文中的偏移量，在图1、2、3中它都是0，只有因为用户内存不足以接收完1个报文时才为非0
+
 			 */
 			offset = *seq - TCP_SKB_CB(skb)->seq;
 			/**
@@ -1934,10 +1939,16 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
     由于是因为用户进程对传输控制块进行的锁定，将TCP段缓存到后备队列，故而，一旦用户进程释放传输控制块就应该立即处理后备队列。
     处理后备队列直接在release_sock中实现，以确保在任何时候解锁传输控制块时能立即处理后备队列。
 
+
 		 */
+
 
 		/* Well, if we have backlog, try to process it now yet. */
 
+		/**
+		 * 	如果receive队列为空，则检查已经拷贝的字节数，是否达到了SO_RCVLOWAT或者长度len。
+		 * 	满足了，且backlog队列也为空，则可以返回用户态了，正如图1的第11步
+		 */
 		if (copied >= target && !sk->sk_backlog.tail)
 			break;
 
@@ -1946,7 +1957,9 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 	异常的情况。如果存在这类情况，就需要结束这次读取，返回前当然还顺便检测后备队列是否存在数据，如果有
 	则还需要处理。
 		 */
-
+        /**
+         * 在tcp_recvmsg里，copied就是已经拷贝的字节数
+         */
 		if (copied) {
 			/*
                 检测条件：
@@ -1993,8 +2006,12 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 			}
 			/**
 			 * 未读到数据，且是非阻塞读取，则返回错误码Try again。
+			 * //如果使用了非阻塞套接字，此时timeo为0
 			 */
 			if (!timeo) {
+			    /**
+			     * 非阻塞套接字读取不到数据时也会返回，错误码正是EAGAIN
+			     */
 				copied = -EAGAIN;
 				break;
 			}
@@ -2010,6 +2027,7 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 		/**
 		 * 在未启用慢速路径的情况下，都会到此检测是否
          *   需要处理prepare队列。
+         *  tcp_low_latency默认是关闭的，图1、图2都是如此，图3则例外，即图3不会走进这个if
 		 */
 		if (!sysctl_tcp_low_latency && tp->ucopy.task == user_recv) {
 			/* Install new reader */
@@ -2058,6 +2076,7 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 			 */
 			/**
 			 *                 如果prequeue队列不为空，则跳转到do_orequeue标签处处理prequeue队列。
+			 * prequeue队列就是为了提高系统整体效率的，即prequeue队列有可能不为空，这是因为进程休眠等待时可能有新报文到达prequeue队列
 			 */
 			if (!skb_queue_empty(&tp->ucopy.prequeue))
 				goto do_prequeue;
@@ -2072,11 +2091,20 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
     如果数据尚未读取，且是阻塞读取，则进入睡眠等待接收数据。这种情况下，tcp_v4_do_rcv处理TCP段时可能会把
     数据直接复制到用户空间。
 		 */
+		 /**
+		  * 如果已经拷贝了的字节数超过了最低阀值
+		  */
 		if (copied >= target) {
 			/* Do not sleep, just process backlog. */
+			/**
+			 * release_sock这个方法会遍历、处理backlog队列中的报文
+			 */
 			release_sock(sk);
 			lock_sock(sk);
 		} else {
+		    /**
+		     * 没有读取到足够长度的消息，因此会进程休眠，如果没有被唤醒，最长睡眠timeo时间
+		     */
 			sk_wait_data(sk, &timeo, last);
 		}
 
@@ -2102,6 +2130,9 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 			if (tp->rcv_nxt == tp->copied_seq &&
 			    !skb_queue_empty(&tp->ucopy.prequeue)) {
 do_prequeue:
+			    /**
+			     * 开始处理prequeue队列里的报文
+			     */
 				tcp_prequeue_process(sk);
 
 				chunk = len - tp->ucopy.len;
@@ -2130,6 +2161,7 @@ do_prequeue:
 		/**
 		 * 获取该可读取段的数据长度，在前面的处理中
             已由TCP序号得到本次读取数据在该段中的偏移。
+            receive队列的这个报文从其可以使用的偏移量offset，到总长度len之间，可以拷贝的长度为used
 		 */
 		used = skb->len - offset;
 		if (len < used)
@@ -2168,11 +2200,13 @@ do_prequeue:
 
 		/**
 		 *     接下来处理读取数据的情况。
+		 *     //MSG_TRUNC标志位表示不要管len这个用户态内存有多大，只管拷贝数据吧
 		 */
 		if (!(flags & MSG_TRUNC)) {
 			/**
 			 * 调用skb_copy_datagram_msg来将数据复制到用户空间
                 并且根据返回的值来判断是否出现了错误。
+                向用户态拷贝数据
 			 */
 			err = skb_copy_datagram_msg(skb, offset, msg, used);
 			if (err) {
@@ -2188,8 +2222,18 @@ do_prequeue:
             数据的长度，剩余的可以使用的用户空间缓存大小。如果是截短，
             则通过调整这些参数，多余的数据就默默被丢弃了。
 		 */
+		 /**
+		  * 因为是指针，所以同时更新copied_seq--下一个待接收的序号
+
+		  */
 		*seq += used;
+		/**
+		 * 更新已经拷贝的长度
+		 */
 		copied += used;
+		/**
+		 * 更新用户态内存的剩余空闲空间长度
+		 */
 		len -= used;
 		/*tcp_rcv_space_adjust调整合理的TCP接收缓存的大小*/
 		tcp_rcv_space_adjust(sk);
@@ -2233,9 +2277,14 @@ skip_copy:
 			sk_eat_skb(sk, skb);
 		break;
 	} while (len > 0);
-
+    /**
+     * 已经装载了接收器
+     */
 	if (user_recv) {
 		//prequeue队列非空
+		/**
+		 * prequeue队列不为空则处理之
+		 */
 		if (!skb_queue_empty(&tp->ucopy.prequeue)) {
 			int chunk;
 
@@ -2259,6 +2308,9 @@ skip_copy:
             不会将数据复制到用户空间，因为只有在未启用tcp_low_latency的情况下，用户进程主动读取
             时，才有机会将数据直接复制到用户空间。
 		 */
+		 /**
+		  * //准备返回用户态，socket上不再装载接收任务
+		  */
 		tp->ucopy.task = NULL;
 		tp->ucopy.len = 0;
 	}
@@ -2273,7 +2325,9 @@ skip_copy:
     返回已经读取的字节数。
 	 */
 	tcp_cleanup_rbuf(sk, copied);
-
+    /**
+     * 释放socket时，还会检查、处理backlog队列中的报文
+     */
 	release_sock(sk);
 	return copied;
 

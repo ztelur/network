@@ -2047,12 +2047,18 @@ static void __lock_sock(struct sock *sk)
 	finish_wait(&sk->sk_lock.wq, &wait);
 }
 
+/**
+ * 处理backlog
+ * @param sk
+ */
 static void __release_sock(struct sock *sk)
 	__releases(&sk->sk_lock.slock)
 	__acquires(&sk->sk_lock.slock)
 {
 	struct sk_buff *skb, *next;
-
+	/**
+	 * 遍历backlog队列
+	 */
 	while ((skb = sk->sk_backlog.head) != NULL) {
 		sk->sk_backlog.head = sk->sk_backlog.tail = NULL;
 
@@ -2063,6 +2069,9 @@ static void __release_sock(struct sock *sk)
 			prefetch(next);
 			WARN_ON_ONCE(skb_dst_is_noref(skb));
 			skb->next = NULL;
+			/**
+			 * 处理报文，其实就是tcp_v4_do_rcv方法，上文介绍过，不再赘述
+			 */
 			sk_backlog_rcv(sk, skb);
 
 			cond_resched();
@@ -2105,6 +2114,11 @@ int sk_wait_data(struct sock *sk, long *timeo, const struct sk_buff *skb)
 
 	prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
 	sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
+	/**
+	 * 等待两个状态
+	 *
+	 * sk_wait_event在睡眠前会调用release_sock，这个方法会释放socket锁
+	 */
 	rc = sk_wait_event(sk, timeo, skb_peek_tail(&sk->sk_receive_queue) != skb);
 	sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
 	finish_wait(sk_sleep(sk), &wait);
@@ -2517,9 +2531,17 @@ void lock_sock_nested(struct sock *sk, int subclass)
 }
 EXPORT_SYMBOL(lock_sock_nested);
 
+/**
+ *
+ * @param sk
+ */
 void release_sock(struct sock *sk)
 {
+
 	spin_lock_bh(&sk->sk_lock.slock);
+	/**
+	 * release_sock
+	 */
 	if (sk->sk_backlog.tail)
 		__release_sock(sk);
 
@@ -2528,7 +2550,10 @@ void release_sock(struct sock *sk)
 	 */
 	if (sk->sk_prot->release_cb)
 		sk->sk_prot->release_cb(sk);
+	/**
+	 *         //这里是网络中断执行时，告诉内核，现在socket并不在进程上下文中
 
+	 */
 	sock_release_ownership(sk);
 	if (waitqueue_active(&sk->sk_lock.wq))
 		wake_up(&sk->sk_lock.wq);
