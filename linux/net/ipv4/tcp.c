@@ -1158,6 +1158,7 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	/**
 	 * 如果是TCP Fast Open feature，则进行相关的特殊发送。
 	 * 关于FAST Open的讨论，详见rfc7413
+	 * 会在发送SYN时携带上数据。
 	 */
 	if (flags & MSG_FASTOPEN) {
 		err = tcp_sendmsg_fastopen(sk, msg, &copied_syn, size);
@@ -1170,6 +1171,7 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	/**
 	 * 获取发送数据是否进行阻塞标识，通过
 	 * sock_sndtimeo()获取阻塞超时时间。
+	 * 当这个套接字是阻塞套接字时，timeo就是SO_SNDTIMEO选项指定的发送超时时间。如果这个套接字是非阻塞套接字， timeo变量就会是0
 	 */
 	timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
 
@@ -1185,15 +1187,24 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	 * 超时则跳转到out_err处做出错处理。
 	 *
 	 * 有一种特殊情况，就是出于fastopen的被动端，第三次可以携带数据
-	 */
+	 * /* 如果连接尚未完成三次握手，是不允许发送数据的，除非是Fast Open的被动打开方 */
+	*/
 	if (((1 << sk->sk_state) & ~(TCPF_ESTABLISHED | TCPF_CLOSE_WAIT)) &&
 	    !tcp_passive_fastopen(sk)) {
+		/**
+		 * 等待连接的建立，成功时返回值为0 */
+		*/
 		err = sk_stream_wait_connect(sk, &timeo);
 		if (err != 0)
 			goto do_error;
 	}
-
+	/**
+	 * 使用TCP_REPAIR选项时
+	 */
 	if (unlikely(tp->repair)) {
+		/**
+		 * 发送到接收队列中
+		 */
 		if (tp->repair_queue == TCP_RECV_QUEUE) {
 			copied = tcp_send_rcvq(sk, msg, size);
 			goto out_nopush;
@@ -1216,6 +1227,9 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	}
 
 	/* This should be in poll */
+	/**
+	 * 清除使用异步情况下，发送队列满了的标志
+	 */
 	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 
 	/* Ok commence sending. */
@@ -1229,16 +1243,24 @@ restart:
 	 * 调用tcp_send_mss获取当前有效的mss
 	 * size_goal存储的是TCP分段中数据部分的最大长度
 	 * 对于不支持分片的网卡，mss就是size_goal
+	 * 如果使用GSO，会是MSS的整数倍。
 	 */
 	mss_now = tcp_send_mss(sk, &size_goal, flags);
 
 	/**
 	 * 在开始分段前，将错误码初始为EPIPE，判断套接字状态
+	 * Broken pipe
 	 */
 	err = -EPIPE;
+	/**
+	 *     /* 如果连接有错误，或者不允许发送数据了，那么返回-EPIPE */
+	*/
 	if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
 		goto out_err;
 
+	/**
+	 *  网卡是否支持分散聚合
+	 */
 	sg = !!(sk->sk_route_caps & NETIF_F_SG);
 	/**
 	 * 知道将所有数据都发送完
@@ -1247,28 +1269,41 @@ restart:
 		/**
 		 * segment过程
 		 */
-		int copy = 0; // 可以拷贝的数据的大小
-		int max = size_goal;
+		int copy = 0; // 可以拷贝的字节数
+		int max = size_goal; //单个skb的最大数据长度，如果使用了GSO，长度为MSS的整数倍
 
 		/**
 		 * 获取sk->sk_write_queue的最后一个skb，用于检查是否用满
 		 * 用满了就新建一个skb放新数据，否则将新数据拼接到这最后一个skb中
 		 */
 		skb = tcp_write_queue_tail(sk);
-		// TODO: tcp_send_head
+		/**
+		 * 还有未发送的数据，说明该skb还未发送
+		 */
 		if (tcp_send_head(sk)) {
+			/**
+			 * 如果网卡不支持检验和计算，那么skb的最大长度为MSS，即不能使用GSO */
+			*/
 			if (skb->ip_summed == CHECKSUM_NONE)
 				max = mss_now;
+			/**
+			 * 此skb可追加的数据长度
+			 */
 			copy = max - skb->len;
 		}
 		/**
 		 * 需要一个新的segment
 		 * //说明sk发送队列的最后一个skb已经没有多余的空间了，则需要从新开辟skb空间
+		 * 需要使用新的skb来装数据
 		 */
 		if (copy <= 0 || !tcp_skb_can_collapse_to(skb)) {
 new_segment:
 			/* Allocate new segment. If the interface is SG,
 			 * allocate skb fitting to single page.
+			 */
+			/**
+			 * 如果发送队列的总大小sk_wmem_queued大于等于发送缓存的上限sk_sndbuf，
+                 * 或者发送缓存中尚未发送的数据量超过了用户的设置值，就进入等待。
 			 */
 			if (!sk_stream_memory_free(sk))
 				goto wait_for_sndbuf;
@@ -1277,6 +1312,12 @@ new_segment:
 				process_backlog = false;
 				goto restart;
 			}
+			/**
+			 * 申请一个skb，其线性数据区的大小为
+			 * 通过select_size()得到的线性数据区中TCP负荷的大小 + 最大的协议头长度
+			 * 如果申请skb失败了，或者虽然申请skb成功，但是从系统层面判断此次申请不合法，
+			 * 那么就进入睡眠，等待内存。
+			 */
 			skb = sk_stream_alloc_skb(sk,
 						  select_size(sk, sg),
 						  sk->sk_allocation,
@@ -1287,6 +1328,7 @@ new_segment:
 			process_backlog = true;
 			/*
 			 * Check whether we can use HW checksum.
+			 * 如果网卡支持校验和的计算，那么由硬件计算报头和首部的校验和。
 			 */
 			if (sk_check_csum_caps(sk))
 				skb->ip_summed = CHECKSUM_PARTIAL;
@@ -1294,6 +1336,9 @@ new_segment:
 			/**
 			 * 将skb放置到sk尾部
 			 */
+			/* 更新skb的TCP控制块字段，把skb加入到sock发送队列的尾部，
+                * 增加发送队列的大小，减小预分配缓存的大小。
+                */
 			skb_entail(sk, skb);
 			/**
 			 * copy表示复制到skb的数据size
@@ -1305,6 +1350,9 @@ new_segment:
 			 * already been sent. skb_mstamp isn't set to
 			 * avoid wrong rtt estimation.
 			 */
+			/**
+			 * 如果使用了TCP REPAIR选项，那么为skb设置“发送时间”
+			 */
 			if (tp->repair)
 				TCP_SKB_CB(skb)->sacked |= TCPCB_REPAIRED;
 		}
@@ -1313,6 +1361,7 @@ new_segment:
 		/**
 		 * 如果允许copy的数值已经大于剩余的data size，
 		 * 设置为实际的剩余的data size
+		 * 本次可拷贝的数据量不能超过数据块的长度。
 		 */
 		if (copy > msg_data_left(msg))
 			copy = msg_data_left(msg);
@@ -1320,17 +1369,21 @@ new_segment:
 		/* Where to copy to? */
 		if (skb_availroom(skb) > 0) {
 			/**
+			 * 如果skb的线性数据区还有剩余空间，就先复制到线性数据区
+			 */
+			/**
 			 * 缓冲区域的剩余区域大小
 			 */
 			/* We have some space in skb head. Superb! */
 			copy = min_t(int, copy, skb_availroom(skb));
 			/**
 			 * 把应用层发送的数据线填充一部分到tail skb中
+			 * 拷贝用户空间的数据到内核空间，同时计算校验和
 			 */
 			err = skb_add_data_nocache(sk, skb, &msg->msg_iter, copy);
 			if (err)
 				goto do_fault;
-		} else {
+		} else { // 如果skb的线性数据区已经用完了，那么就使用分页区
 			/**
 			 * 线性缓冲已经满了，将数据考到shinfo
 			 *
@@ -1342,18 +1395,26 @@ new_segment:
 			/**
 			 * 获取当前skb的分segment数，在skb_shared_info中用nr_frags表示
 			 */
-			int i = skb_shinfo(skb)->nr_frags;
+			int i = skb_shinfo(skb)->nr_frags; /* 分页数 */
 
-			struct page_frag *pfrag = sk_page_frag(sk);
-
+			struct page_frag *pfrag = sk_page_frag(sk); /* 上次缓存的分页 */
+			/* 检查分页是否有可用空间，如果没有就申请新的page。
+                 * 如果申请失败，说明系统内存不足。
+                 * 之后会设置TCP内存压力标志，减小发送缓冲区的上限，睡眠等待内存。
+                 */
 			if (!sk_page_frag_refill(sk, pfrag))
 				goto wait_for_memory;
 
 			/**
 			 * 判断能否在最后一个分片加数据
+			 * 判断能否往最后一个分页追加数据
 			 */
 			if (!skb_can_coalesce(skb, i, pfrag->page,
 					      pfrag->offset)) {
+				/* 不能追加时，检查分页数是否达到了上限，或者网卡不支持分散聚合。
+                     * 如果是的话，就为此skb设置PSH标志，尽快地发送出去。
+                     * 然后跳转到new_segment处申请新的skb，来继续填装数据。
+                     */
 				if (i == sysctl_max_skb_frags || !sg) {
 					/**
 					 * 无法设置分配，就重新分配一个SKB
@@ -1365,12 +1426,15 @@ new_segment:
 			}
 
 			copy = min_t(int, copy, pfrag->size - pfrag->offset);
-
+//			从系统层面判断发送缓存的申请是否合法
 			if (!sk_wmem_schedule(sk, copy))
 				goto wait_for_memory;
 			/**
 			 * 将用户数据库拷贝到SKB中
 			 */
+			/* 拷贝用户空间的数据到内核空间，同时计算校验和。
+                * 更新skb的长度字段，更新sock的发送队列大小和预分配缓存。
+                */
 			err = skb_copy_to_page_nocache(sk, &msg->msg_iter, skb,
 						       pfrag->page,
 						       pfrag->offset,
@@ -1378,9 +1442,13 @@ new_segment:
 			if (err)
 				goto do_error;
 			/* 更新SKB */
+			/**
+			 *  如果把数据追加到最后一个分页了，更新最后一个分页的数据大小 */
+			 */
 			if (merge) {
 				skb_frag_size_add(&skb_shinfo(skb)->frags[i - 1], copy);
 			} else {
+//				初始化新增加的页
 				skb_fill_page_desc(skb, i, pfrag->page,
 						   pfrag->offset, copy);
 				get_page(pfrag->page);
@@ -1388,16 +1456,19 @@ new_segment:
 			pfrag->offset += copy;
 		}
 
+		/**
+		 * 如果这是第一次拷贝，取消PSH标志
+		 */
 		if (!copied)
 			TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_PSH;
 		/*
 		 * 更新TCP的发送序号
 		 */
-		tp->write_seq += copy;
-		TCP_SKB_CB(skb)->end_seq += copy;
+		tp->write_seq += copy; // 更新发送队列的最后一个序号
+		TCP_SKB_CB(skb)->end_seq += copy; //更新skb的结束序号
 		tcp_skb_pcount_set(skb, 0);
 
-		copied += copy;
+		copied += copy; //已经拷贝到发送队列的数据量
 		if (!msg_data_left(msg)) {
 			tcp_tx_timestamp(sk, sockc.tsflags, skb);
 			if (unlikely(flags & MSG_EOR))
@@ -1405,6 +1476,10 @@ new_segment:
 			goto out;
 		}
 
+		/**
+		 * 如果skb还可以继续填充数据，或者发送的是带外数据，或者使用TCP REPAIR选项，
+             * 那么继续拷贝数据，先不发送。
+		 */
 		if (skb->len < max || (flags & MSG_OOB) || unlikely(tp->repair))
 			continue;
 
@@ -1416,8 +1491,12 @@ new_segment:
 			 * 调用相关函数将队列中的数据立刻发送
 			 */
 			tcp_mark_push(tp, skb);
+			/* 尽可能的将发送队列中的skb发送出去，禁用nalge */
 			__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
 		} else if (skb == tcp_send_head(sk))
+			/**
+			 * 只发送一个skb
+			 */
 			tcp_push_one(sk, mss_now);
 		continue;
 
@@ -1429,15 +1508,21 @@ wait_for_sndbuf:
 wait_for_memory:
 		/**
 		 * 如果已经有一部分数据了，那么先将数据发送出去
+		 * 如果已经有数据复制到发送队列了，就尝试立即发送
 		 */
 		if (copied)
 			tcp_push(sk, flags & ~MSG_MORE, mss_now,
 				 TCP_NAGLE_PUSH, size_goal);
 
+		/* 分两种情况：
+                 * 1. sock的发送缓存不足。等待sock有发送缓存可写事件，或者超时。
+                 * 2. TCP层内存不足，等待2~202ms之间的一个随机时间。
+                 */
+
 		err = sk_stream_wait_memory(sk, &timeo);
 		if (err != 0)
 			goto do_error;
-
+/* 睡眠后MSS和TSO段长可能会发生变化，重新计算 */
 		mss_now = tcp_send_mss(sk, &size_goal, flags);
 	}
 	/**
@@ -1459,13 +1544,15 @@ out_nopush:
 	return copied + copied_syn;
 
 do_fault:
+	/* 如果skb没有负荷 */
 	if (!skb->len) {
+		/* 把skb从发送队列中删除 */
 		tcp_unlink_write_queue(skb, sk);
 		/* It is the one place in all of TCP, except connection
 		 * reset, where we can be unlinking the send_head.
 		 */
-		tcp_check_send_head(sk, skb);
-		sk_wmem_free_skb(sk, skb);
+		tcp_check_send_head(sk, skb); /* 是否要撤销sk->sk_send_head */
+		sk_wmem_free_skb(sk, skb); /* 更新发送队列的大小和预分配缓存，释放skb */
 	}
 
 do_error:

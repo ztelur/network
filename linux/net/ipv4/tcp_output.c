@@ -1566,6 +1566,10 @@ static void tcp_cwnd_validate(struct sock *sk, bool is_cwnd_limited)
 /* Minshall's variant of the Nagle send check. */
 static bool tcp_minshall_check(const struct tcp_sock *tp)
 {
+	/**
+  //最后一次发送的小分组还没有被确认
+	//将要发送的序号是要大于等于上次发送分组对应的序号
+	 */
 	return after(tp->snd_sml, tp->snd_una) &&
 		!after(tp->snd_sml, tp->snd_nxt);
 }
@@ -1595,6 +1599,11 @@ static void tcp_minshall_update(struct tcp_sock *tp, unsigned int mss_now,
 static bool tcp_nagle_check(bool partial, const struct tcp_sock *tp,
 			    int nonagle)
 {
+	/**
+	 * //先检查是否为小分组，即报文长度是否小于MS
+	 * 如果开启了Nagle算法
+	 *  若已经有小分组发出（packets_out表示“飞行”中的分组）还没有确认
+	 */
 	return partial &&
 		((nonagle & TCP_NAGLE_CORK) ||
 		 (!nonagle && tp->packets_out && tcp_minshall_check(tp)));
@@ -1654,6 +1663,17 @@ static unsigned int tcp_mss_split_point(const struct sock *sk,
 
 /* Can at least one segment of SKB be sent right now, according to the
  * congestion window rules?  If so, return how many segments are allowed.
+ * 根据congestion window能否有segment被发送出去。检查报文个数
+ */
+/**
+ * 拥塞窗口就是下面的cwnd，它用来帮助慢启动的实现。连接刚建立时，拥塞窗口的大小远小于发送窗口，
+ * 它实际上是一个MSS。每收到一个ACK，拥塞窗口扩大一个MSS大小，当然，拥塞窗口最大只能到对方通告的接收窗口大小。
+ * 当然，为了避免指数式增长，拥塞窗口大小的增长会更慢一些，是线性的平滑的增长过程。
+ *
+ * 检查飞行的报文数是否小于拥塞窗口个数
+ * @param tp
+ * @param skb
+ * @return
  */
 static inline unsigned int tcp_cwnd_test(const struct tcp_sock *tp,
 					 const struct sk_buff *skb)
@@ -1665,6 +1685,9 @@ static inline unsigned int tcp_cwnd_test(const struct tcp_sock *tp,
 	    tcp_skb_pcount(skb) == 1)
 		return 1;
 
+	/**
+	 * 飞行中的数据，也就是没有ACK的字节总数
+	 */
 	in_flight = tcp_packets_in_flight(tp);
 	cwnd = tp->snd_cwnd;
 	if (in_flight >= cwnd)
@@ -1674,6 +1697,9 @@ static inline unsigned int tcp_cwnd_test(const struct tcp_sock *tp,
 	 * 2 GSO packets in flight.
 	 */
 	halfcwnd = max(cwnd >> 1, 1U);
+	/**
+	 * 如果拥塞窗口允许，需要返回依据拥塞窗口的大小，还能发送多少字节的数据
+	 */
 	return min(halfcwnd, cwnd - in_flight);
 }
 
@@ -1695,6 +1721,8 @@ static int tcp_init_tso_segs(struct sk_buff *skb, unsigned int mss_now)
 
 /* Return true if the Nagle test allows this packet to be
  * sent now.
+ *
+ *
  */
 static inline bool tcp_nagle_test(const struct tcp_sock *tp, const struct sk_buff *skb,
 				  unsigned int cur_mss, int nonagle)
@@ -1705,29 +1733,50 @@ static inline bool tcp_nagle_test(const struct tcp_sock *tp, const struct sk_buf
 	 * This is implemented in the callers, where they modify the 'nonagle'
 	 * argument based upon the location of SKB in the send queue.
 	 */
+	/**
+	 * nonagle标志位设置了，返回1表示允许这个分组发送出去
+	 */
 	if (nonagle & TCP_NAGLE_PUSH)
 		return true;
 
 	/* Don't use the nagle rule for urgent data (or for the final FIN). */
+	/**
+	 * 如果这个分组包含了四次握手关闭连接的FIN包，也可以发送出去
+	 * urgent data 都不实用nagle
+	 */
 	if (tcp_urg_mode(tp) || (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN))
 		return true;
-
+	/**
+	 * //检查Nagle算法
+	 */
 	if (!tcp_nagle_check(skb->len < cur_mss, tp, nonagle))
 		return true;
 
 	return false;
 }
 
+/**
+ * 检查这一次要发送的报文最大序号是否超出了发送滑动窗口大小
+ * @param tp
+ * @param skb
+ * @param cur_mss
+ * @return
+ */
 /* Does at least the first segment of SKB fit into the send window? */
 static bool tcp_snd_wnd_test(const struct tcp_sock *tp,
 			     const struct sk_buff *skb,
 			     unsigned int cur_mss)
 {
+	/**
+	 * end_seq待发送的最大序号
+	 */
 	u32 end_seq = TCP_SKB_CB(skb)->end_seq;
 
 	if (skb->len > cur_mss)
 		end_seq = TCP_SKB_CB(skb)->seq + cur_mss;
-
+	/**
+	 * snd_una是已经发送过的数据中，最小的没被确认的序号；而snd_wnd就是发送窗口的大小
+	 */
 	return !after(end_seq, tcp_wnd_end(tp));
 }
 
