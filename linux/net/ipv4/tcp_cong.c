@@ -20,6 +20,13 @@ static DEFINE_SPINLOCK(tcp_cong_list_lock);
 static LIST_HEAD(tcp_cong_list);
 
 /* Simple linear search, don't expect many entries! */
+/**
+ * 其中，\mintinline{c}{tcp_ca_find_key}函数通过哈希值来查找名称。jash是一种久经考验的
+	性能极佳的哈希算法。据称，其计算速度和产生的分布都很漂亮。这里计算哈希值正是使用了这种
+	哈希算法。早些版本的内核查找拥塞控制算法，是通过名字直接查找的，如下:
+ * @param name
+ * @return
+ */
 static struct tcp_congestion_ops *tcp_ca_find(const char *name)
 {
 	struct tcp_congestion_ops *e;
@@ -48,6 +55,12 @@ static const struct tcp_congestion_ops *__tcp_ca_find_autoload(const char *name)
 }
 
 /* Simple linear search, not much in here. */
+/**
+ * 可以看到，每次查找都要对比字符串，效率较低。这里为了加快查找速度，对名字进行了哈希，
+	并通过哈希值的比对来进行查找
+ * @param key
+ * @return
+ */
 struct tcp_congestion_ops *tcp_ca_find_key(u32 key)
 {
 	struct tcp_congestion_ops *e;
@@ -64,24 +77,36 @@ struct tcp_congestion_ops *tcp_ca_find_key(u32 key)
  * Attach new congestion control algorithm to the list
  * of available options.
  */
+/**
+ * 该函数用于注册一个新的拥塞控制算法
+ * @param ca
+ * @return
+ */
 int tcp_register_congestion_control(struct tcp_congestion_ops *ca)
 {
 	int ret = 0;
 
 	/* all algorithms must implement ssthresh and cong_avoid ops */
+	/**
+	 * 所有拥塞控制算法都必须实现ssthresh和cong_avoid
+	 */
 	if (!ca->ssthresh || !ca->cong_avoid) {
 		pr_err("%s does not implement required ops\n", ca->name);
 		return -EINVAL;
 	}
-
+	/* 计算算法名称的哈希值，加快比对速度。 */
 	ca->key = jhash(ca->name, sizeof(ca->name), strlen(ca->name));
 
 	spin_lock(&tcp_cong_list_lock);
 	if (ca->key == TCP_CA_UNSPEC || tcp_ca_find_key(ca->key)) {
+		/* 如果已经注册被注册过了，或者恰巧hash值重了(极低概率)，
+		 * 那么返回错误值。
+		 */
 		pr_notice("%s already registered or non-unique key\n",
 			  ca->name);
 		ret = -EEXIST;
 	} else {
+		/* 将算法添加到链表中 */
 		list_add_tail_rcu(&ca->list, &tcp_cong_list);
 		pr_debug("%s registered\n", ca->name);
 	}
@@ -97,9 +122,14 @@ EXPORT_SYMBOL_GPL(tcp_register_congestion_control);
  * to ensure that this can't be done till all sockets using
  * that method are closed.
  */
+/**
+ * 撤销一个拥塞控制算法
+ * @param ca
+ */
 void tcp_unregister_congestion_control(struct tcp_congestion_ops *ca)
 {
 	spin_lock(&tcp_cong_list_lock);
+	/* 删除该拥塞控制算法 */
 	list_del_rcu(&ca->list);
 	spin_unlock(&tcp_cong_list_lock);
 
@@ -374,10 +404,21 @@ int tcp_set_congestion_control(struct sock *sk, const char *name)
  * ABC caps N to 2. Slow start exits when cwnd grows over ssthresh and
  * returns the leftover acks to adjust cwnd in congestion avoidance mode.
  */
+/**
+ * 这里不妨举个例子。如果ssthresh的值为6，初始cwnd为1。那么按照TCP的标准，拥塞窗口
+大小的变化应当为1,2,4,6而不是1,2,4,8。当处于慢启动的状态时，acked的数目完全由慢启动决定。
+慢启动部分的代码如下
+ * @param tp
+ * @param acked
+ * @return
+ */
 u32 tcp_slow_start(struct tcp_sock *tp, u32 acked)
 {
+	/* 新的拥塞窗口的大小等于ssthresh和cwnd中较小的那一个 */
 	u32 cwnd = min(tp->snd_cwnd + acked, tp->snd_ssthresh);
-
+	/* 如果新的拥塞窗口小于ssthresh，则acked=0。
+         * 否则acked为超过ssthresh部分的数目。
+         */
 	acked -= cwnd - tp->snd_cwnd;
 	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);
 
@@ -388,16 +429,33 @@ EXPORT_SYMBOL_GPL(tcp_slow_start);
 /* In theory this is tp->snd_cwnd += 1 / tp->snd_cwnd (or alternative w),
  * for every packet that was ACKed.
  */
+/**
+ * 在更新完窗口大小以后，CUBIC模块没有直接改变窗口值，而是通过调用
+   来改变窗口大小的。这个函数原本只是单纯地每次将
+   窗口大小增加一定的值。但是在经历了一系列的修正后，变得较为难懂了。
+ * @param tp
+ * @param w
+ * @param acked
+ */
 void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w, u32 acked)
 {
 	/* If credits accumulated at a higher w, apply them gently now. */
+	/* 这里做了一个奇怪的小补丁，用于解决这样一种情况：
+         * 如果w很大，那么，snd_cwnd_cnt可能会积累为一个很大的值。
+         * 此后，w由于种种原因突然被缩小了很多。那么下面计算处理的delta就会很大。
+         * 这可能导致流量的爆发。为了避免这种情况，这里提前增加了一个特判。
+	*/
 	if (tp->snd_cwnd_cnt >= w) {
 		tp->snd_cwnd_cnt = 0;
 		tp->snd_cwnd++;
 	}
-
+	/* 累计被确认的包的数目 */
 	tp->snd_cwnd_cnt += acked;
 	if (tp->snd_cwnd_cnt >= w) {
+		/* 窗口增大的大小应当为被确认的包的数目除以当前窗口大小。
+                 * 以往都是直接加一，但直接加一并不是正确的加法增加(AI)的实现。
+                 * 例如，w为10，acked为20时，应当增加20/10=2，而不是1。
+                 */
 		u32 delta = tp->snd_cwnd_cnt / w;
 
 		tp->snd_cwnd_cnt -= delta * w;

@@ -1878,9 +1878,13 @@ static inline void tcp_init_undo(struct tcp_sock *tp)
 	tp->undo_retrans = tp->retrans_out ? : -1;
 }
 
-/* Enter Loss state. If we detect SACK reneging, forget all SACK information
+/* Enter Loss state. If we detect SACK reneging(违约), forget all SACK information
  * and reset tags completely, otherwise preserve SACKs. If receiver
  * dropped its ofo queue, we will know this due to reneging detection.
+ */
+/**
+ *
+ * @param sk
  */
 void tcp_enter_loss(struct sock *sk)
 {
@@ -1895,18 +1899,30 @@ void tcp_enter_loss(struct sock *sk)
 	if (icsk->icsk_ca_state <= TCP_CA_Disorder ||
 	    !after(tp->high_seq, tp->snd_una) ||
 	    (icsk->icsk_ca_state == TCP_CA_Loss && !icsk->icsk_retransmits)) {
-		tp->prior_ssthresh = tcp_current_ssthresh(sk);
-		tp->snd_ssthresh = icsk->icsk_ca_ops->ssthresh(sk);
-		tcp_ca_event(sk, CA_EVENT_LOSS);
+        /*保留当前的阙值*/
+        tp->prior_ssthresh = tcp_current_ssthresh(sk);
+        /*计算新的阙值*/
+        tp->snd_ssthresh = icsk->icsk_ca_ops->ssthresh(sk);
+        /*发送CA_EVENT_LOSS拥塞事件给具体拥塞算法模块*/
+        tcp_ca_event(sk, CA_EVENT_LOSS);
 		tcp_init_undo(tp);
 	}
-	tp->snd_cwnd	   = 1;
+    /*拥塞窗口大小设置为1*/
+    tp->snd_cwnd	   = 1;
+    /*snd_cwnd_cnt表示自从上次调整拥塞窗口到
+     目前为止接收到的总ACK段数，自然设置为0*/
 	tp->snd_cwnd_cnt   = 0;
-	tp->snd_cwnd_stamp = tcp_time_stamp;
-
+    /*记录最近一次检验拥塞窗口的时间*/
+    tp->snd_cwnd_stamp = tcp_time_stamp;
+    /*设置重传的但还未得到确认的TCP段的数目为零*/
 	tp->retrans_out = 0;
-	tp->lost_out = 0;
-
+    /*丢失的包*/
+    tp->lost_out = 0;
+    /*
+        查看当前的tp里是否由SACK选项字段，
+        有的话，返回1,没有的话返回0
+        根据这一点来判断是否需要重置tp中选择确认的包的个数为0
+    */
 	if (tcp_is_reno(tp))
 		tcp_reset_reno_sack(tp);
 
@@ -2511,16 +2527,83 @@ static inline void tcp_end_cwnd_reduction(struct sock *sk)
 	tcp_ca_event(sk, CA_EVENT_COMPLETE_CWR);
 }
 
+/**
+ * enum tcp_ca_state {
+    TCP_CA_Open = 0,
+#define TCPF_CA_Open    (1<<TCP_CA_Open)
+    TCP_CA_Disorder = 1,
+#define TCPF_CA_Disorder (1<<TCP_CA_Disorder)
+    TCP_CA_CWR = 2,
+#define TCPF_CA_CWR (1<<TCP_CA_CWR)
+    TCP_CA_Recovery = 3,
+#define TCPF_CA_Recovery (1<<TCP_CA_Recovery)
+    TCP_CA_Loss = 4
+#define TCPF_CA_Loss    (1<<TCP_CA_Loss)
+};
+
+
+
+ Open:             Open状态是常态，在这种状态下TCP发送方通过优化后的快速路径来处理接收ACK。当一个确认到达时，
+                   发送方根据拥塞窗口是小于还是大于慢启动阙值，按慢启动或者拥塞避免来增大拥塞窗口。
+
+ Disorder:         当发送方检测到DACK(重复确认)或者SACK(选择性确认)时，
+                    将转变为Disorder(无序)状态。在该状态下，拥塞窗口不做调整，
+                    而是每个新到的段触发一个新的数据段的发送。
+                    因此，TCP发送方遵循包守恒原则，该原则规定一个新包只有在一个老的包离开网络后才发送。
+                    在实践中，该规定的表现类似于IETF的传输提议，允许当拥塞窗口较小或是上个传输窗口中有大量数据段丢失时，
+                    使用快速重传以更有效地恢复。
+
+ CWR:               TCP发送方可能从显式拥塞通知、
+                    ICMP源端抑制(ICMP source quench)或是本地设备接收到拥塞通知。
+                    当收到一个拥塞通知时，发送方并不立刻减小拥塞窗口，
+                    而是每隔一个新到的ACK减小一个段直到窗口的大小减半为止。
+                    发送方在减小拥塞窗口大小的过程中不会有明显的重传，
+                    这就处于CWR(Congestion Window Reduced,拥塞窗口减小)状态。
+                    CWR状态可以被Revcovery状态或者Loss状态中断。进入拥塞窗口减小的函数如下：
+
+
+ Recovery:            当足够多的连续重复ACK到达后，
+                    发送方重传第一个没有被确认的段，进入Recovery(恢复)状态。
+                    默认情况下，进入Recovery状态的条件是三个连续的重复ACK，TCP拥塞控制规范也是这么推荐的。
+                    在Recovery状态期间，拥塞窗口的大小每隔一个新到的确认而减少一个段，和CWR状态类似。
+                    这个窗口减小过程终止与拥塞窗口大小等于ssthresh，即进入Recovery状态时，窗口大小的一半。
+                    拥塞窗口在恢复期间不增大，发送方重传那些被标记为丢失的段，或者根据包守恒原则在新数据上标记前向传输。
+                    发送方保持Recovery状态直到所有进入Recovery状态时正在发送的数据段都成功地被确认，之后该发送方恢复OPEN状态，
+                    重传超时有可能中断Recovery状态。
+
+
+ CongestionState:Loss:  当一个RTO到期后，发送方进入Loss状态。所有正在发送的数据段标记为丢失，
+            拥塞窗口设置为一个段，发送方因此以慢启动算法增大拥塞窗口。
+            Loss和Recovery状态的区别是:Loss状态下，拥塞窗口在发送方设置为一个段后增大，
+            而Recovery状态下，拥塞窗口只能被减小。Loss状态不能被其他的状态中断，
+            因此，发送方只有在所有Loss开始时正在传输的数据都得到成功确认后，才能退到Open状态。
+            例如，快速重传不能在Loss状态期间被触发，这和NewReno规范是一致的。
+
+            当接收到的ACK的确认已经被之前的SACK确认过，这意味着我们记录的SACK信息不能反映接收方的实际状态，
+            此时，也会进入Loss状态。
+ * @param sk
+ */
+
+/**
+ *
+ * @param sk
+ */
 /* Enter CWR state. Disable cwnd undo since congestion is proven with ECN */
 void tcp_enter_cwr(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-
+    /*进入CWR后就不需要窗口撤消了，
+      因此需要清除拥塞控制的慢启动阙值
+    */
 	tp->prior_ssthresh = 0;
-	if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR) {
-		tp->undo_marker = 0;
-		tcp_init_cwnd_reduction(sk);
-		tcp_set_ca_state(sk, TCP_CA_CWR);
+    /*可以看出只有Open状态和Disorder状态可以转移到该状态*/
+    if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR) {
+        /*进入CWR状态后不允许在进行拥塞窗口撤消了*/
+        tp->undo_marker = 0;
+        /*进行相关的初始化*/
+        tcp_init_cwnd_reduction(sk);
+        /*设置状态*/
+        tcp_set_ca_state(sk, TCP_CA_CWR);
 	}
 }
 EXPORT_SYMBOL(tcp_enter_cwr);

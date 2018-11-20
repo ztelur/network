@@ -927,6 +927,10 @@ out:
 /**
  * 真正的发送操作由它完成，构建TCP的首部，并将包交给IP层。
  * 由于数据包需要等到ACK后才释放，所以需要发送队列中长期保留一份SKB的备份。
+ * tcp_transmit_skb的作用是复制或者拷贝skb，构造skb中的tcp首部，并将调用网络层的发送函数发送skb；
+ * 在发送前，首先需要克隆或者复制skb，因为在成功发送到网络设备之后，skb会释放，而tcp层不能真正的释放，
+ * 是需要等到对该数据段的ack才可以释放；然后构造tcp首部和选项；最后调用网络层提供的发送回调函数发送skb，
+ * ip层的回调函数为ip_queue_xmit
  * @param sk
  * @param skb
  * @param clone_it
@@ -1681,6 +1685,9 @@ static inline unsigned int tcp_cwnd_test(const struct tcp_sock *tp,
 	u32 in_flight, cwnd, halfcwnd;
 
 	/* Don't be strict about the congestion window for the final FIN.  */
+	/**
+	 *     /*对FIN包不检测，让他通过*/
+	*/
 	if ((TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) &&
 	    tcp_skb_pcount(skb) == 1)
 		return 1;
@@ -1706,6 +1713,13 @@ static inline unsigned int tcp_cwnd_test(const struct tcp_sock *tp,
 /* Initialize TSO state of a skb.
  * This must be invoked the first time we consider transmitting
  * SKB onto the wire.
+ *
+ */
+/**
+ * 该函数根据当前mss的值重新设置数据包中的struct skb_shared_info内的关于GSO的内容项。
+ * @param skb
+ * @param mss_now
+ * @return
  */
 static int tcp_init_tso_segs(struct sk_buff *skb, unsigned int mss_now)
 {
@@ -1771,7 +1785,10 @@ static bool tcp_snd_wnd_test(const struct tcp_sock *tp,
 	 * end_seq待发送的最大序号
 	 */
 	u32 end_seq = TCP_SKB_CB(skb)->end_seq;
-
+	/**
+	 * 如果skb的len大于mss,则end_seq等于等待发送的序号+当前的mss，因为有fragment的存在，
+	 * 只会检测一个mss的最大的序号是否在窗口前边
+	 */
 	if (skb->len > cur_mss)
 		end_seq = TCP_SKB_CB(skb)->seq + cur_mss;
 	/**
@@ -2164,7 +2181,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 	u32 max_segs;
 
 	/**
-	 * 统计发送包的数量
+	 * 统计发送包的数量，用来统计函数中已经发送的报文总数
 	 */
 	sent_pkts = 0;
 	// 当push_one为0时
@@ -2180,6 +2197,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		}
 	}
 
+	/*13~21首先初始化为0，接着发送一个路径MTU探测报文，如果成功则发送报文数加1。*/
+
+
 	/**
 	 * 获取最大segment数
 	 */
@@ -2192,6 +2212,10 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		/**
 		 * 获取TSO信息
 		 */
+		/**
+		 * /*设置有关TSO的信息，包括GSO类型，GSO分段的大小等等。这些信息是准备给软件TSO分段使用的。
+        如果网络设备不支持TSO，但又使用了TSO功能，则报文在提交给网络设备之前，需进行软分段，即由代码实现TSO分段。*/
+		 */
 		tso_segs = tcp_init_tso_segs(skb, mss_now);
 		BUG_ON(!tso_segs);
 
@@ -2202,6 +2226,13 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		}
 		/**
 		 * 获取CWND的剩余大小
+		 */
+
+		/**
+		 * /*检测拥塞窗口的大小，如果为0，则说明拥塞窗口已满，目前不能发送。
+        拿拥塞窗口和正在网络上传输的包数目相比，如果拥塞窗口还大，则返回拥塞窗口减掉正在网络上传输的包数目剩下的大小。
+        该函数目的是判断正在网络上传输的包数目是否超过拥塞窗口，如果超过了，则不发送。
+        tcp_cwnd_test()源代码见段二*/
 		 */
 		cwnd_quota = tcp_cwnd_test(tp, skb);
 		if (!cwnd_quota) {
@@ -2216,19 +2247,27 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		}
 		/**
 		 * 如果当前段不完全在发送窗口，则无法发送
-		 */
+		 * 检测当前报文是否完全处于发送窗口内，如果是则可以发送，否则不能发送*/
+		*/
 		if (unlikely(!tcp_snd_wnd_test(tp, skb, mss_now)))
 			break;
 
+		/*tso_segs=1表示无需tso分段*/
 		if (tso_segs == 1) {
 			/**
 			 * 如果无需TSO分段，则检测是否启用Nagle算法
-			 */
+			 *             /*根据nagle算法，计算是否需要发送数据*/
+			*/
 			if (unlikely(!tcp_nagle_test(tp, skb, mss_now,
 						     (tcp_skb_is_last(sk, skb) ?
 						      nonagle : TCP_NAGLE_PUSH))))
 				break;
 		} else {
+			/**
+			 * /*如果需要TSO分段，则检测该报文是否应该延时发送。tcp_tso_should_defer()用来检测GSO段是否需要延时发送。
+            在段中有FIN标志，或者不处于open拥塞状态，或者TSO段延时超过2个时钟滴答，或者拥塞窗口和发送窗口的最小值大于64K或三倍的当前有效MSS，
+            在这些情况下会立即发送，而其他情况下会延时发送，这样主要是为了减少软GSO分段的次数，以提高性能。*/
+			 */
 			/**
 			 * 如果需要TSO分段，则检测是否需要延迟发送
 			 */
@@ -2239,8 +2278,13 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		}
 		/**
 		 * 根据mss对包进行分包处理
-		 */
+		 *         /*limit为再次分段的段长，初始化为当前MSS*/
+		*/
 		limit = mss_now;
+		/**
+		 * /*在TSO分片大于1并且不是URG模式下，通过mss_now计算limit的值
+        以发送窗口和拥塞窗口的最小值作为分段段长*/
+		 */
 		if (tso_segs > 1 && !tcp_urg_mode(tp))
 			limit = tcp_mss_split_point(sk, skb, mss_now,
 						    min_t(unsigned int,
@@ -2253,6 +2297,11 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		if (skb->len > limit &&
 		    unlikely(tso_fragment(sk, skb, limit, mss_now, gfp)))
 			break;
+
+		/*line61~71：根据条件，可能需要对SKB中的报文进行分段处理，分段的报文包括两种：一种是普通的用MSS分段的报文，另一种则是TSO分段的报文。
+        能否发送报文主要取决于两个条件：一是报文需完全在发送窗口中，而是拥塞窗口未满。第一种报文，应该不会再分段了，因为在tcp_sendmsg()中创建报文的SKB时已经根据MSS处理了，
+        而第二种报文，则一般情况下都会大于MSS，因为通过TSO分段的段有可能大于拥塞窗口的剩余空间，如果是这样，就需要以发送窗口和拥塞窗口的最小值作为段长对报文再次分段。*/
+
 
 		/* TCP Small Queues :
 		 * Control number of packets in qdisc/devices to two packets / or ~1 ms.
@@ -2287,6 +2336,11 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			break;
 
 repair:
+		/**
+		 * 调用tcp_event_new_data_sent()-->tcp_advance_send_head()更新sk_send_head，即取发送队列中的下一个SKB。
+        同时更新snd_nxt，即等待发送的下一个TCP段的序号，然后统计发出但未得到确认的数据报个数。
+        最后如果发送该报文前没有需要确认的报文，则复位重传定时器，对本次发送的报文做重传超时计时。
+		 */
 		/* Advance the send_head.  This one is sent out.
 		 * This call will increment packets_out.
 		 */
@@ -2294,6 +2348,10 @@ repair:
 		/**
 		 * 如果发送的段小于mss，则更新最后一个小包的序号
 		 */
+		 /**
+		  * /*更新struct tcp_sock中的snd_sml字段。snd_sml表示最近发送的小包(小于MSS的段)的最后一个字节序号，
+        在发送成功后，如果报文小于MSS，即更新该字段，主要用来判断是否启动nagle算法*/
+		  */
 		tcp_minshall_update(tp, mss_now, skb);
 		sent_pkts += tcp_skb_pcount(skb);
 
@@ -2303,6 +2361,9 @@ repair:
 	/**
 	 * 如果发送了数据，则更新相关的数据统计
 	 */
+	 /**
+	  *     /*如果本次有数据发送，则对TCP拥塞窗口进行检查确认。*/
+	*/
 	if (likely(sent_pkts)) {
 		if (tcp_in_cwnd_reduction(sk))
 			tp->prr_out += sent_pkts;
@@ -2314,6 +2375,7 @@ repair:
 		tcp_cwnd_validate(sk, is_cwnd_limited);
 		return false;
 	}
+	/*如果本次没有数据发送，则根据已发送但未确认的报文数packets_out和sk_send_head返回，packets_out不为零或sk_send_head为空都视为有数据发出，因此返回成功。*/
 	return !tp->packets_out && tcp_send_head(sk);
 }
 
