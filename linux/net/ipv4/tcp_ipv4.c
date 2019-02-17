@@ -1240,9 +1240,17 @@ static const struct tcp_request_sock_ops tcp_request_sock_ipv4_ops = {
 	.init_seq	=	tcp_v4_init_sequence,
 	.send_synack	=	tcp_v4_send_synack,
 };
-
+/**
+ * 服务端用来处理客户端连接请求的函数
+ * @param sk
+ * @param skb
+ * @return
+ */
 int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 {
+    /**
+     * 如果一个 SYN 段是要被发送到广播地址和组播地址，则直接 drop 掉，然后返回 0。
+     */
 	/* Never answer to SYNs send to broadcast or multicast */
 	if (skb_rtable(skb)->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))
 		goto drop;
@@ -1417,11 +1425,23 @@ int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 	 * 处理TCP_LISTEN
 	 */
 	if (sk->sk_state == TCP_LISTEN) {
+	    // 进行响应的cookie检测
+	    /**
+	     * TCP 的 SYN Cookie 机制是为了防范 SYN Flood 攻击而产生的。
+	     * 其思想是在收到 TCP SYN 包后，根据 SYN 包的信息计算一个 cookie
+	     * 值作为 SYN+ACK 报的初始序 列号
+	     */
+	    /**
+	     * /*
+				NULL，错误
+				nsk == sk，接收到 SYN
+				nsk != sk，接收到 ACK */
+	     */
 		struct sock *nsk = tcp_v4_cookie_check(sk, skb);
 
 		if (!nsk)
 			goto discard;
-		if (nsk != sk) {
+		if (nsk != sk) {  //不等于，收到了ACK
 			sock_rps_save_rxhash(nsk, skb);
 			sk_mark_napi_id(nsk, skb);
 			if (tcp_child_process(sk, nsk, skb)) {
@@ -1432,7 +1452,10 @@ int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 		}
 	} else
 		sock_rps_save_rxhash(sk, skb);
-
+    // 处理接收到的SYNC段，返回1，表示错误
+    /**
+     * 负责维护TCP的状态机
+     */
 	if (tcp_rcv_state_process(sk, skb)) {
 		rsk = sk;
 		goto reset;

@@ -47,6 +47,7 @@ MODULE_PARM_DESC(smooth_part, "log(B/(B*Smin))/log(B/(B-1))+B, # of RTT from Wma
 
 /* BIC TCP Parameters */
 struct bictcp {
+	// 每次cwnd增长1/cnt的比例
 	u32	cnt;		/* increase cwnd by 1 after ACKs */
 	u32	last_max_cwnd;	/* last maximum snd_cwnd */
 	u32	loss_cwnd;	/* congestion window at last loss */

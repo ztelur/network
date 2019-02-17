@@ -1928,12 +1928,14 @@ void tcp_enter_loss(struct sock *sk)
 
 	skb = tcp_write_queue_head(sk);
 	is_reneg = skb && (TCP_SKB_CB(skb)->sacked & TCPCB_SACKED_ACKED);
-	if (is_reneg) {
+    /*判断接受者是否认为SACK违约*/
+    if (is_reneg) {
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPSACKRENEGING);
 		tp->sacked_out = 0;
 		tp->fackets_out = 0;
 	}
-	tcp_clear_all_retrans_hints(tp);
+    /*清除有关重传的记忆变量*/
+    tcp_clear_all_retrans_hints(tp);
 
 	tcp_for_write_queue(skb, sk) {
 		if (skb == tcp_send_head(sk))
@@ -1941,13 +1943,18 @@ void tcp_enter_loss(struct sock *sk)
 
 		TCP_SKB_CB(skb)->sacked &= (~TCPCB_TAGBITS)|TCPCB_SACKED_ACKED;
 		if (!(TCP_SKB_CB(skb)->sacked&TCPCB_SACKED_ACKED) || is_reneg) {
-			TCP_SKB_CB(skb)->sacked &= ~TCPCB_SACKED_ACKED;
-			TCP_SKB_CB(skb)->sacked |= TCPCB_LOST;
-			tp->lost_out += tcp_skb_pcount(skb);
-			tp->retransmit_high = TCP_SKB_CB(skb)->end_seq;
+            /*清除ACK标志*/
+            TCP_SKB_CB(skb)->sacked &= ~TCPCB_SACKED_ACKED;
+            /*添加LOST标志*/
+            TCP_SKB_CB(skb)->sacked |= TCPCB_LOST;
+            /*统计丢失段的数量*/
+            tp->lost_out += tcp_skb_pcount(skb);
+            /*重传的最大序号??????*/
+            tp->retransmit_high = TCP_SKB_CB(skb)->end_seq;
 		}
 	}
-	tcp_verify_left_out(tp);
+    /*确认没有被确认的TCP段的数量left_out*/
+    tcp_verify_left_out(tp);
 
 	/* Timeout in disordered state after receiving substantial DUPACKs
 	 * suggests that the degree of reordering is over-estimated.
@@ -1956,9 +1963,12 @@ void tcp_enter_loss(struct sock *sk)
 	    tp->sacked_out >= net->ipv4.sysctl_tcp_reordering)
 		tp->reordering = min_t(unsigned int, tp->reordering,
 				       net->ipv4.sysctl_tcp_reordering);
-	tcp_set_ca_state(sk, TCP_CA_Loss);
-	tp->high_seq = tp->snd_nxt;
-	tcp_ecn_queue_cwr(tp);
+    /*设置拥塞状态*/
+    tcp_set_ca_state(sk, TCP_CA_Loss);
+    /*记录发生拥塞时的snd.nxt*/
+    tp->high_seq = tp->snd_nxt;
+    /*设置ecn_flags,表示发送方进入拥塞状态*/
+    tcp_ecn_queue_cwr(tp);
 
 	/* F-RTO RFC5682 sec 3.1 step 1: retransmit SND.UNA if no previous
 	 * loss recovery is underway except recurring timeout(s) on
@@ -2472,17 +2482,28 @@ static bool tcp_try_undo_loss(struct sock *sk, bool frto_undo)
  *      But when the retransmits are acked without further losses, PRR
  *      slow starts cwnd up to ssthresh to speed up the recovery.
  */
+/**
+ * 在CWR和Recovery状态的cwnd reduction使用PRR算法。
+ *
+ * @param sk
+ */
 static void tcp_init_cwnd_reduction(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-
+/* 开始拥塞的时候下一个要发送的字节序号 */
 	tp->high_seq = tp->snd_nxt;
 	tp->tlp_high_seq = 0;
+	/* 自从上次调整拥塞窗口到目前为止接收到的总 ACK 段数 */
 	tp->snd_cwnd_cnt = 0;
+	/* 在进入 Recovery 状态时的拥塞窗口 */
 	tp->prior_cwnd = tp->snd_cwnd;
+	/* 在恢复阶段给接收者新发送包的数量 */
 	tp->prr_delivered = 0;
+	/* 在恢复阶段一共发送的包的数量 */
 	tp->prr_out = 0;
+	/* 根据拥塞算法，计算新阈值 */
 	tp->snd_ssthresh = inet_csk(sk)->icsk_ca_ops->ssthresh(sk);
+	/* 设置 TCP_ECN_QUEUE_CWR 标志，标识由于收到显式拥塞通知而进入拥塞状态 */
 	tcp_ecn_queue_cwr(tp);
 }
 
@@ -2592,7 +2613,7 @@ static inline void tcp_end_cwnd_reduction(struct sock *sk)
 void tcp_enter_cwr(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-    /*进入CWR后就不需要窗口撤消了，
+    /* 进入CWR后就不需要窗口撤消了，
       因此需要清除拥塞控制的慢启动阙值
     */
 	tp->prior_ssthresh = 0;
@@ -2841,6 +2862,27 @@ static bool tcp_try_undo_partial(struct sock *sk, const int acked)
  * It does _not_ decide what to send, it is made in function
  * tcp_xmit_retransmit_queue().
  */
+/**
+ * 这里计算校验码需要我们仔细分析一下，remain to do.????
+
+        \subsubsection{TCP对ECN的支持}
+            路由器使用IP包的相关域来设置相关标志位来表示是否发生了拥塞.而主机使用TCP的首部来告知发送方,网络正在经历拥塞。
+
+            TCP使用6位保留位（Reserved）的后两位来支持ECN。两个新的标志CWR、ECE含义如下
+\begin{enumerate}
+\item[CWR]  CWR为发送端缩小拥塞窗口标志，用来通知接收端它已经收到了设置ECE标志的ACK。
+
+\item[ECE]  ECE有两个作用，在TCP三次握手时表明TCP端是否支持ECN；在传输数据时表明接收到的
+            TCP段的IP首部的ECN被设置为11，即接收端发现了拥塞.
+\end{enumerate}
+
+            当两个支持ECN的TCP端进行TCP连接时，它们交换SYN、SYN+ACK、ACK段。对于支持ECN
+            的TCP端来说，SYN段的ECE和CWR标志都被设置了，SYN的ACK只设置ECE标志。
+
+            相关宏定义如下:
+\begin{minted}[linenos]{c}
+define TCP_ECN_OK          1
+/* 本端被通知了拥塞，此时作为发送方*/
 static void tcp_fastretrans_alert(struct sock *sk, const int acked,
 				  bool is_dupack, int *ack_flag, int *rexmit)
 {
@@ -2849,17 +2891,36 @@ static void tcp_fastretrans_alert(struct sock *sk, const int acked,
 	int fast_rexmit = 0, flag = *ack_flag;
 	bool do_lost = is_dupack || ((flag & FLAG_DATA_SACKED) &&
 				    (tcp_fackets_out(tp) > tp->reordering));
-
+	/*WARN的返回值是什么呢？
+        如果没有待确认的包以及并且选择确认的包的数量不为0，
+        就置其为零。
+    */
 	if (WARN_ON(!tp->packets_out && tp->sacked_out))
 		tp->sacked_out = 0;
 	if (WARN_ON(!tp->sacked_out && tp->fackets_out))
 		tp->fackets_out = 0;
-
+	/**
+	 * /*
+        如果选择确认的包的数量为零，并且未确认与已选择确认之间存在段
+    */
 	/* Now state machine starts.
 	 * A. ECE, hence prohibit cwnd undoing, the reduction is required. */
+	/**
+	 *  接下来，拥塞状态处理机启动。
+\begin{minted}[linenos]{c}
+    /*  Now state machine starts.
+        A. ECE, hence prohibit(阻止) cwnd undoing, the reduction is required.
+        由于接收到显式拥塞通知，因此禁止窗口撤销，并且开始减小拥塞窗口。
+    */
+
 	if (flag & FLAG_ECE)
 		tp->prior_ssthresh = 0;
-
+	/**
+	 *  如果接收到的ACK指向已记录的SACK，这说明我们记录的SACK并没有反应接收方的真实状态。
+    也就是说接收方现在已经处于严重的拥塞状态或者在处理上有bug，那么我们接下来就要按照重传超时的方式去处理。
+    因为按照正常的逻辑流程，接受的ACK不应该指向已记录的SACK，而应指向SACK并未包含的，这说明接收方由于拥塞已经把
+    SACK部分接收的段已经丢弃或者处理上有BUG，我们必须需要重传了。
+	 */
 	/* B. In all the states check for reneging SACKs. */
 	if (tcp_check_sack_reneging(sk, flag))
 		return;
@@ -2867,46 +2928,78 @@ static void tcp_fastretrans_alert(struct sock *sk, const int acked,
 	/* C. Check consistency of the current state. */
 	tcp_verify_left_out(tp);
 
+	/**
+	 *     查看是否从发送队列发出的包的数量是否不小于发出主机的包的数量。
+
+	 */
+	 /**
+	  *     接下来检测从拥塞状态返回的条件，当high\_seq被确认时，结束拥塞状态，进入Open状态。
+
+	  */
 	/* D. Check state exit conditions. State can be terminated
 	 *    when high_seq is ACKed. */
 	if (icsk->icsk_ca_state == TCP_CA_Open) {
+		//根据条件判断是否输出警告信息
 		WARN_ON(tp->retrans_out != 0);
+		//消除上一次的重传时间戳
 		tp->retrans_stamp = 0;
 	} else if (!before(tp->snd_una, tp->high_seq)) {
+		/**
+		 * snd_una是待 ACK 的第一个字节的序号
+		 * high_seq:开始拥塞的时候下一个要发送的序号字节
+		 * snd_una > high_seq 说明拥塞情况已经好转了
+		 */
+
+		/*  进入的条件是tp->snd_una>tp->high_seq,即
+            拥塞时，记录的SND.NXT被确认了。拥塞情况已经好转很多了。
+            此时如果拥塞状态不处于OPen状态，可根据当前的状态结束回
+            到Open状态。
+        */
 		switch (icsk->icsk_ca_state) {
 		case TCP_CA_CWR:
 			/* CWR is to be held something *above* high_seq
 			 * is ACKed for CWR bit to reach receiver. */
 			if (tp->snd_una != tp->high_seq) {
+				//结束窗口减小
 				tcp_end_cwnd_reduction(sk);
+				//回到OPen状态
 				tcp_set_ca_state(sk, TCP_CA_Open);
 			}
 			break;
 
 		case TCP_CA_Recovery:
+			//判断对方是否提供了SACK服务，提供，返回0,否则返回1
 			if (tcp_is_reno(tp))
+				//设置sacked_out为0
 				tcp_reset_reno_sack(tp);
+				/*尝试从Recovery状态撤销
+                        成功，就直接返回。
+                    */
 			if (tcp_try_undo_recovery(sk))
 				return;
-			tcp_end_cwnd_reduction(sk);
+				//结束拥塞窗口缩小
+				tcp_end_cwnd_reduction(sk);
 			break;
 		}
 	}
 
-	/* Use RACK to detect loss */
+	/* Use RACK 重传确认ack to detect loss */
 	if (sysctl_tcp_recovery & TCP_RACK_LOST_RETRANS &&
 	    tcp_rack_mark_lost(sk)) {
-		flag |= FLAG_LOST_RETRANS;
+		flag |= FLAG_LOST_RETRANS; //说明重传的丢失
 		*ack_flag |= FLAG_LOST_RETRANS;
 	}
 
 	/* E. Process state. */
 	switch (icsk->icsk_ca_state) {
 	case TCP_CA_Recovery:
+		//判断是否没有段被确认
 		if (!(flag & FLAG_SND_UNA_ADVANCED)) {
+			//判断是否启用了SACK,未启用返回1,并且收到的是重复的ACK，
 			if (tcp_is_reno(tp) && is_dupack)
 				tcp_add_reno_sack(sk);
 		} else {
+			/*确认了部分重传的段*/
 			if (tcp_try_undo_partial(sk, acked))
 				return;
 			/* Partial ACK arrived. Force fast retransmit. */
@@ -2920,21 +3013,23 @@ static void tcp_fastretrans_alert(struct sock *sk, const int acked,
 		break;
 	case TCP_CA_Loss:
 		tcp_process_loss(sk, flag, is_dupack, rexmit);
-		if (icsk->icsk_ca_state != TCP_CA_Open &&
+			//判断是否开启了SACK，没启用返回1
+			if (icsk->icsk_ca_state != TCP_CA_Open &&
 		    !(flag & FLAG_LOST_RETRANS))
 			return;
 		/* Change state if cwnd is undone or retransmits are lost */
 	default:
 		if (tcp_is_reno(tp)) {
 			if (flag & FLAG_SND_UNA_ADVANCED)
-				tcp_reset_reno_sack(tp);
+				tcp_reset_reno_sack(tp); //重置sacked
 			if (is_dupack)
-				tcp_add_reno_sack(sk);
+				tcp_add_reno_sack(sk); //记录接收到的sack
 		}
 
 		if (icsk->icsk_ca_state <= TCP_CA_Disorder)
 			tcp_try_undo_dsack(sk);
-
+//确定能够离开Disorder状态，而进入Recovery状态。
+			//如果不进入Recovery状态，判断可否进入OPen状态。
 		if (!tcp_time_to_recover(sk, flag)) {
 			tcp_try_to_open(sk, flag);
 			return;
@@ -2955,7 +3050,8 @@ static void tcp_fastretrans_alert(struct sock *sk, const int acked,
 		tcp_enter_recovery(sk, (flag & FLAG_ECE));
 		fast_rexmit = 1;
 	}
-
+//如果接收到重复的ACK或者重传队首的段超时，
+	//则要为确定丢失的段更新记分牌
 	if (do_lost)
 		tcp_update_scoreboard(sk, fast_rexmit);
 	*rexmit = REXMIT_LOST;
@@ -5914,7 +6010,12 @@ reset_and_undo:
  *	It's called from both tcp_v4_rcv and tcp_v6_rcv and should be
  *	address independent.
  */
-
+/**
+ * 传输控制块，
+ * @param sk
+ * @param skb 传输控制块缓冲区
+ * @return
+ */
 int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -5929,15 +6030,17 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb)
 		goto discard;
 
 	case TCP_LISTEN:
+	    // 不应该有ack
 		if (th->ack)
 			return 1;
-
+        // reset标签
 		if (th->rst)
 			goto discard;
-
+        // 同步标签
 		if (th->syn) {
 			if (th->fin)
 				goto discard;
+
 			if (icsk->icsk_af_ops->conn_request(sk, skb) < 0)
 				return 1;
 
@@ -6312,25 +6415,40 @@ static void tcp_reqsk_record_syn(const struct sock *sk,
 		}
 	}
 }
-
+/**
+ * 服务端用来处理客户端连接请求的函数
+ * @param rsk_ops 请求控制块的函数接口
+ * @param af_ops TCP请求块的函数接口
+ * @param sk
+ * @param skb
+ * @return
+ */
 int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		     const struct tcp_request_sock_ops *af_ops,
 		     struct sock *sk, struct sk_buff *skb)
 {
+	// 初始化len字段
 	struct tcp_fastopen_cookie foc = { .len = -1 };
+	// initial sequence num 初始化序列号
 	__u32 isn = TCP_SKB_CB(skb)->tcp_tw_isn;
 	struct tcp_options_received tmp_opt;
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct net *net = sock_net(sk);
 	struct sock *fastopen_sk = NULL;
 	struct dst_entry *dst = NULL;
+
 	struct request_sock *req;
+	// 标志是否开启了 SYN_COOKIE 选项
 	bool want_cookie = false;
 	struct flowi fl;
 
 	/* TW buckets are converted to open requests without
 	 * limitations, they conserve resources and peer is
 	 * evidently real one.
+	 */
+	/**
+	 * 如果打开了 SYNCOOKIE 选项，并且 SYN 请求队列已满并且 isn 为 0, 然后通过函数 tcp_syn_flood_action 判断是否需要
+	 * 发送 syncookie。如果没有启用 syncookie 的话， 就会返回 false，此时不能接收新的 SYN 请求，会将所收到的包丢掉。
 	 */
 	if ((net->ipv4.sysctl_tcp_syncookies == 2 ||
 	     inet_csk_reqsk_queue_is_full(sk)) && !isn) {
@@ -6345,15 +6463,25 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 	 * clogging syn queue with openreqs with exponentially increasing
 	 * timeout.
 	 */
+	/**
+	 * 如果完成连接的套接字的队列长度已经达到上限且SYN请求队列至少有一个握手过程没有重传段，则丢弃当前请求。
+	 */
 	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1) {
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
 		goto drop;
 	}
-
+	/**
+	 * 这时调用inet_reqsk_alloc分配一个连接请求块，用于保存连接请求信息，同时初 始化在连接
+	 * 过程中用来发送 ACK/RST 段的操作集合，以便在建立连接过程中能方便地 调用这些接口。
+	 * 如果申请不了资源的话，就会放弃此次连接请求。
+	 */
 	req = inet_reqsk_alloc(rsk_ops, sk, !want_cookie);
 	if (!req)
 		goto drop;
 
+	/**
+	 * 清除 TCP 选项，初始化mss_vlamp和user_mss. 然后调用tcp_parse_options解 析 SYN 段中的 TCP 选项，查看是否有相关的选项
+	 */
 	tcp_rsk(req)->af_specific = af_ops;
 
 	tcp_clear_options(&tmp_opt);
@@ -6422,9 +6550,9 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		if (!dst)
 			goto drop_and_free;
 	}
-
+	// 显示拥塞控制
 	tcp_ecn_create_request(req, skb, sk, dst);
-
+	// 如果开启了 cookie 的话，就需要进行相应的初始化
 	if (want_cookie) {
 		isn = cookie_init_sequence(af_ops, sk, skb, &req->mss);
 		req->cookie_ts = tmp_opt.tstamp_ok;
@@ -6439,6 +6567,9 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		tcp_reqsk_record_syn(sk, req, skb);
 		fastopen_sk = tcp_try_fastopen(sk, skb, req, &foc, dst);
 	}
+	/**
+	 * 如果开启了 fastopen 的话，顺便发送数据 否则就是简单地发送。
+	 */
 	if (fastopen_sk) {
 		af_ops->send_synack(fastopen_sk, dst, &fl, req,
 				    &foc, TCP_SYNACK_FASTOPEN);

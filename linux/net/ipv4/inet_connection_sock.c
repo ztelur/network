@@ -788,7 +788,13 @@ static void inet_child_forget(struct sock *sk, struct request_sock *req,
 	inet_csk_destroy_sock(child);
 	reqsk_put(req);
 }
-
+/**
+ * 将请求块加入队列
+ * @param sk
+ * @param req
+ * @param child
+ * @return
+ */
 struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
 				      struct request_sock *req,
 				      struct sock *child)
@@ -800,6 +806,7 @@ struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
 		inet_child_forget(sk, req, child);
 		child = NULL;
 	} else {
+		// 入列
 		req->sk = child;
 		req->dl_next = NULL;
 		if (queue->rskq_accept_head == NULL)

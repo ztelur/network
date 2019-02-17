@@ -808,7 +808,13 @@ EXPORT_SYMBOL(tcp_check_req);
  * locked is obtained, other packets cause the same connection to
  * be created.
  */
-
+/**
+ *
+ * @param parent 父传输控制块
+ * @param child 子传输控制块
+ * @param skb 传输控制块缓存
+ * @return
+ */
 int tcp_child_process(struct sock *parent, struct sock *child,
 		      struct sk_buff *skb)
 {
@@ -816,12 +822,15 @@ int tcp_child_process(struct sock *parent, struct sock *child,
 	int state = child->sk_state;
 
 	tcp_segs_in(tcp_sk(child), skb);
+	// 此时刚刚创建的新的子传输控制块没有被用户进程占用
 	if (!sock_owned_by_user(child)) {
+		// 根据第三次 握手的 ACK 段，调用tcp_rcv_state_process继续对子传输控制块做初始化
 		ret = tcp_rcv_state_process(child, skb);
 		/* Wakeup parent, send SIGIO */
 		if (state == TCP_SYN_RECV && child->sk_state != state)
 			parent->sk_data_ready(parent);
 	} else {
+		// 加入后备队列中，等空闲时再进行处理
 		/* Alas, it is possible again, because we do lookup
 		 * in main socket hash table and lock on listening
 		 * socket does not protect us more.

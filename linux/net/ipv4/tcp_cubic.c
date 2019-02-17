@@ -407,7 +407,9 @@ static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
-
+	/**
+	 * ssthresh 慢启动阈值
+	 */
 	if (!tcp_is_cwnd_limited(sk))
 		return;
 	/* 当tp->snd_cwnd < tp->snd_ssthresh时，
@@ -420,8 +422,16 @@ static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 		if (!acked)
 			return;
 	}
+	/**
+	 * 也就是说，如果满足 cwnd < ssthresh，那么，bictcp_cong_avoid就表现为慢启动。
+	 * 否 则，就表现为拥塞避免。拥塞避免状态下，调用bictcp_update来更新拥塞窗口的值
+	 */
 	bictcp_update(ca, tp->snd_cwnd, acked);
+	/**
+	 * 在更新完窗口大小以后，CUBIC 模块没有直接改变窗口值，而是通过调用 tcp_cong_avoid_ai来 改变窗口大小的
+	 */
 	tcp_cong_avoid_ai(tp, ca->cnt, acked);
+
 }
 
 /**
@@ -472,6 +482,11 @@ CUBIC模块中，就是\mintinline{c}{bictcp_state}函数。
  */
 static void bictcp_state(struct sock *sk, u8 new_state)
 {
+	/**
+	 * CUBIC 只特殊处理了一种状态:TCP_CA_Loss。可以看到，
+	 * 当进入了 LOSS 以后，就会 调用bictcp_reset函数，重置拥塞控制参数。
+	 * 这样，拥塞控制算法就会重新从慢启动开 始执行。
+	 */
 	if (new_state == TCP_CA_Loss) {
 		bictcp_reset(inet_csk_ca(sk));
 		bictcp_hystart_reset(sk);
@@ -595,9 +610,24 @@ Cubic算法所实现的操作如下
 static struct tcp_congestion_ops cubictcp __read_mostly = {
 	.init		= bictcp_init,
 	.ssthresh	= bictcp_recalc_ssthresh,
+	/**
+	 * 避免拥塞状态
+	 */
 	.cong_avoid	= bictcp_cong_avoid,
+	/**
+	 * 拥塞状态机的状态发生改变时，会调用set_stat    e函数
+	 */
 	.set_state	= bictcp_state,
+	/**
+	 * CUBIC 通过返回当前拥塞窗口和上一次 LOSS 状态
+	 * 时的拥塞控制窗口中的最大值，来得到窗口缩小前的大小
+	 *
+	 * 撤销CWND减少
+	 */
 	.undo_cwnd	= bictcp_undo_cwnd,
+	/**
+	 * bictcp_cwnd_event
+	 */
 	.cwnd_event	= bictcp_cwnd_event,
 	.pkts_acked     = bictcp_acked,
 	.owner		= THIS_MODULE,
